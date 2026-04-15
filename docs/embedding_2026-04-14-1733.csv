@@ -1,0 +1,6 @@
+ENTITY_NAME,SUMMARY_TEXT,SIMILARITY
+DOWNTOWN,DOWNTOWN is a luxury neighborhood in Boston with 2233 properties. Average property value is $6524195 (median $1411500). Average price per sqft is $1273. Average property age is 46 years.,0.7829978466
+WEST END,WEST END is a luxury neighborhood in Boston with 3951 properties. Average property value is $3801281 (median $713500). Average price per sqft is $916. Average property age is 96 years.,0.7721896903
+SOUTH END,SOUTH END is a upper-mid neighborhood in Boston with 6692 properties. Average property value is $1997570 (median $948500). Average price per sqft is $959. Average property age is 93 years.,0.760036968
+EAST BOSTON,EAST BOSTON is a mid neighborhood in Boston with 8576 properties. Average property value is $1084476 (median $696550). Average price per sqft is $491. Average property age is 92 years.,0.7504765019
+SOUTH BOSTON,SOUTH BOSTON is a mid neighborhood in Boston with 11929 properties. Average property value is $1396646 (median $833600). Average price per sqft is $832. Average property age is 89 years.,0.7476192713

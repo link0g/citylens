@@ -1,0 +1,6 @@
+langgraph
+langchain
+langchain-anthropic
+snowflake-snowpark-python
+snowflake-connector-python[pandas]
+pandas
