@@ -39,6 +39,10 @@ print(f"   Warehouse : {session.get_current_warehouse()}")
 
 DB = "CITYLENS_MERGED_DB"
 
+
+# Simple in-memory cache
+_query_cache = {}
+CACHE_MAX_SIZE = 100
 # ---------------------------------------------------------------------------
 # Table Config
 # ---------------------------------------------------------------------------
@@ -98,6 +102,7 @@ class CityLensState(TypedDict):
     latency_ms:       int
     reflection_score: int
     final_answer:     str
+    confidence_score: float
 
 
 # ---------------------------------------------------------------------------
@@ -784,17 +789,38 @@ def reflection_node(state: CityLensState) -> dict:
 
     if any(char.isdigit() for char in answer):
         score += 30
-
     keywords = ['boston', 'district', 'neighborhood', 'line', 'route',
                 'mbta', 'crime', 'property', 'housing']
     if any(k in answer.lower() for k in keywords):
         score += 40
-
     if 100 < len(answer) < 1500:
         score += 30
 
+    # Confidence Score
+    raw_context = state.get("raw_context", {})
+    total_items = sum(len(v) for v in raw_context.values())
+    
+    # 基于 retrieval 量和 branch 确定性
+    if total_items >= 50:
+        data_confidence = 1.0
+    elif total_items >= 20:
+        data_confidence = 0.8
+    elif total_items >= 10:
+        data_confidence = 0.6
+    else:
+        data_confidence = 0.4
+
+    branch = state.get("branch", "")
+    scores_sum = state.get("total_retrievals", 0)
+    branch_confidence = 0.9 if branch != "cross" else 0.75
+
+    confidence = round((data_confidence + branch_confidence) / 2, 2)
+
     print(f"  ⭐ Reflection score: {score}/100")
-    return {"reflection_score": score, "final_answer": answer}
+    print(f"  🎯 Confidence: {confidence}")
+
+    return {"reflection_score": score, "final_answer": answer, 
+            "confidence_score": confidence}
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +875,18 @@ def run_citylens(user_query: str) -> str:
     print(f"❓ {user_query}")
     print('='*60)
 
+    # Check cache
+    cache_key = user_query.lower().strip()
+    if cache_key in _query_cache:
+        print("  ⚡ Cache hit! Returning cached answer.")
+        cached = _query_cache[cache_key]
+        print(f"\n{'='*60}")
+        print("🤖 FINAL ANSWER (cached):")
+        print(cached["answer"])
+        print(f"\n⏱  Latency    : 0ms (cached)")
+        print(f"🎯 Confidence : {cached['confidence']}")
+        return cached["answer"]
+
     initial_state: CityLensState = {
         "user_query":       user_query,
         "query_id":         str(uuid.uuid4()),
@@ -862,10 +900,21 @@ def run_citylens(user_query: str) -> str:
         "answer":           "",
         "latency_ms":       0,
         "reflection_score": 0,
+        "confidence_score": 0.0,
         "final_answer":     "",
     }
 
     result = citylens_graph.invoke(initial_state)
+
+    # Save to cache
+    if len(_query_cache) >= CACHE_MAX_SIZE:
+        oldest_key = next(iter(_query_cache))
+        del _query_cache[oldest_key]
+    
+    _query_cache[cache_key] = {
+        "answer":     result["final_answer"],
+        "confidence": result["confidence_score"]
+    }
 
     print(f"\n{'='*60}")
     print("🤖 FINAL ANSWER:")
@@ -873,6 +922,7 @@ def run_citylens(user_query: str) -> str:
     print(f"\n⏱  Latency    : {result['latency_ms']}ms")
     print(f"📊 Retrievals : {result['total_retrievals']}")
     print(f"⭐ Score      : {result['reflection_score']}/100")
+    print(f"🎯 Confidence : {result['confidence_score']}")
     print(f"🌿 Branch     : {result['branch']}")
 
     return result["final_answer"]
@@ -883,4 +933,7 @@ def run_citylens(user_query: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run_citylens("How do condos compare to single family homes in Boston?")
+    # 第一次跑（正常速度）
+    run_citylens("What are the most expensive neighborhoods in Boston?")
+    # 第二次跑同样问题（应该瞬间返回）
+    run_citylens("What are the most expensive neighborhoods in Boston?")
