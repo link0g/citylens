@@ -1,20 +1,8 @@
 # =============================================================================
-# CityLens — LangGraph Multi-Agent Pipeline
+# CityLens — LangGraph Multi-Agent Pipeline (Full RAG Version)
 # =============================================================================
-# Architecture:
-#
-#   User Query
-#       ↓
-#   [Router Node]         — identifies branch + intent
-#       ↓
-#   [Retrieval Node]      — pulls data from Snowflake SERVING layer
-#       ↓
-#   [Synthesis Node]      — combines results, calls LLM
-#       ↓
-#   [Reflection Node]     — scores answer quality
-#       ↓
-#   Final Answer
-#
+# All analysts now use vector similarity search (EMBED_TEXT_768)
+# instead of fixed ORDER BY queries.
 # =============================================================================
 
 import json
@@ -45,11 +33,11 @@ DB = "CITYLENS_MERGED_DB"
 
 class Tables:
     # Housing
+    HOUSING_QA_CONTEXT           = f"{DB}.HOUSING_SERVING.SRV_HOUSING_QA_CONTEXT"
     HOUSING_NEIGHBORHOOD_SUMMARY = f"{DB}.HOUSING_SERVING.SRV_NEIGHBORHOOD_SUMMARY"
     HOUSING_PROPERTY_SUMMARY     = f"{DB}.HOUSING_SERVING.SRV_PROPERTY_PROFILE_SUMMARY"
     HOUSING_MART_EXCEPTIONS      = f"{DB}.HOUSING_MART.MART_TOP_HOUSING_EXCEPTIONS"
     HOUSING_FACT_PROPERTY        = f"{DB}.HOUSING_CORE.FACT_PROPERTY_VALUE"
-    HOUSING_DIM_NEIGHBORHOOD     = f"{DB}.HOUSING_CORE.DIM_NEIGHBORHOOD"
     HOUSING_DIM_PROPERTY_TYPE    = f"{DB}.HOUSING_CORE.DIM_PROPERTY_TYPE"
 
     # Transportation
@@ -60,7 +48,10 @@ class Tables:
     TRANSPORT_RELIABILITY        = f"{DB}.CITYLENS_SERVING.SRV_ROUTE_RELIABILITY"
     TRANSPORT_MONTHLY_TREND      = f"{DB}.CITYLENS_SERVING.SRV_MONTHLY_TREND"
     TRANSPORT_STATION_RANKING    = f"{DB}.CITYLENS_SERVING.SRV_STATION_RISK_RANKING"
+    TRANSPORT_ROUTE_CONTEXT      = f"{DB}.CITYLENS_SERVING.SRV_ROUTE_CONTEXT"
     TRANSPORT_ALERTS_SUMMARY     = f"{DB}.CITYLENS_MART.MART_ALERTS_SUMMARY"
+    TRANSPORT_DAYPART            = f"{DB}.CITYLENS_SERVING.SRV_DAYPART_PERFORMANCE"
+    TRANSPORT_DAYOFWEEK          = f"{DB}.CITYLENS_SERVING.SRV_DAYOFWEEK_PERFORMANCE"
 
     # Crime
     CRIME_CLEAN                  = f"{DB}.CRIME_PUBLIC.CRIME_CLEAN"
@@ -71,7 +62,7 @@ class Tables:
 
     # Cross-branch
     DISTRICT_NEIGHBORHOOD_MAP    = f"{DB}.CRIME_PUBLIC.DISTRICT_NEIGHBORHOOD_MAP"
-    STATION_NEIGHBORHOOD_MAP = f"{DB}.CRIME_PUBLIC.STATION_NEIGHBORHOOD_MAP"
+    STATION_NEIGHBORHOOD_MAP     = f"{DB}.CRIME_PUBLIC.STATION_NEIGHBORHOOD_MAP"
 
 
 # ---------------------------------------------------------------------------
@@ -110,38 +101,16 @@ def router_node(state: CityLensState) -> CityLensState:
     crime_keywords     = ['crime', 'shooting', 'robbery', 'assault', 'burglary',
                           'larceny', 'fraud', 'arrest', 'district', 'safe', 'dangerous',
                           'offense', 'incident', 'police', 'weapon']
-    cross_keywords = [
-    # 明确的跨域比较
-    'compare', 'correlation', 'relationship', 'between', 'affect',
-    'impact', 'vs', 'versus', 'connection', 'link', 'relate',
-    'associated', 'influence', 'effect', 'factor',
-
-    # 居住建议类
-    'where should i live', 'best place to live', 'where to live',
-    'should i move', 'best neighborhood', 'recommend', 'suggestion',
-    'good place', 'ideal', 'best area', 'where to buy',
-
-    # 价格 + 其他维度
-    'high pricing', 'expensive area', 'pricing area', 'price and crime',
-    'affordable and safe', 'cheap and safe', 'price and transit',
-    'price and commute', 'value and safety', 'cost and crime',
-    'how does price', 'how does cost', 'does price',
-
-    # 安全 + 其他维度
-    'low crime', 'high crime', 'safe neighborhood', 'dangerous area',
-    'safest', 'most dangerous', 'safety and', 'crime and housing',
-    'crime and transit', 'crime rate and', 'shooting and price',
-
-    # 交通 + 其他维度
-    'transit access', 'commute and', 'mbta and', 'transit and housing',
-    'transit and crime', 'near transit', 'good commute',
-    'transportation and', 'accessible and',
-
-    # 综合生活质量
-    'livability', 'quality of life', 'best of both', 'overall',
-    '综合', 'trade off', 'balance', 'pros and cons',
-    'worth living', 'good to live', 'nice area',
-]
+    cross_keywords     = ['compare', 'correlation', 'relationship', 'between',
+                          'affect', 'impact', 'vs', 'versus', 'and crime',
+                          'and housing', 'and transit', 'neighborhood safety',
+                          'livability', 'relate', 'connection', 'how does',
+                          'where should i live', 'best place to live',
+                          'where to live', 'should i move', 'high pricing',
+                          'expensive area', 'price and crime', 'pricing area',
+                          'low crime', 'high crime', 'does the', 'will have',
+                          'best of both', 'overall', 'quality of life',
+                          'price crime', 'pricing and crime']
 
     housing_score   = sum(1 for k in housing_keywords   if k in query)
     transport_score = sum(1 for k in transport_keywords  if k in query)
@@ -154,7 +123,7 @@ def router_node(state: CityLensState) -> CityLensState:
         'crime':          crime_score,
     }
 
-   # 强制 cross 规则
+    # Forced cross rules
     if ('price' in query or 'pricing' in query or 'expensive' in query or 'cheap' in query) and \
        ('crime' in query or 'safe' in query or 'dangerous' in query):
         branch = 'cross'
@@ -188,7 +157,7 @@ def router_node(state: CityLensState) -> CityLensState:
     elif branch == 'transportation':
         if any(w in query for w in ['best time', 'avoid crowd', 'quiet']):
             intent = 'best_time'
-        elif any(w in query for w in ['reliable', 'reliability']):
+        elif any(w in query for w in ['reliable', 'reliability', 'unreliable']):
             intent = 'reliability'
         elif any(w in query for w in ['trend', 'month']):
             intent = 'trend'
@@ -196,6 +165,8 @@ def router_node(state: CityLensState) -> CityLensState:
             intent = 'weather'
         elif any(w in query for w in ['alert', 'delay', 'disruption']):
             intent = 'alerts'
+        elif any(w in query for w in ['station', 'stop', 'busy']):
+            intent = 'station'
         else:
             intent = 'general'
 
@@ -240,7 +211,7 @@ def router_node(state: CityLensState) -> CityLensState:
 
 
 # ---------------------------------------------------------------------------
-# Node 2: Retrieval
+# Node 2: Retrieval — All analysts use RAG
 # ---------------------------------------------------------------------------
 
 def safe_serialize(obj):
@@ -249,16 +220,45 @@ def safe_serialize(obj):
     return str(obj)
 
 
-# Housing analysts
-def housing_neighborhood_analyst():
-    results = session.sql(f"""
-        SELECT ENTITY_NAME, NEIGHBORHOOD_TIER, VALUE_SCORE, SUMMARY_TEXT
-        FROM {Tables.HOUSING_NEIGHBORHOOD_SUMMARY}
-        ORDER BY VALUE_SCORE DESC LIMIT 10
-    """).to_pandas()
+def rag_query(table, query_text, extra_cols="", extra_filter="", limit=8):
+    """Generic RAG retrieval using vector cosine similarity."""
+    safe_query = query_text.replace("'", "''")
+    sql = f"""
+        SELECT SUMMARY_TEXT,
+               VECTOR_COSINE_SIMILARITY(
+                   EMBEDDING,
+                   SNOWFLAKE.CORTEX.EMBED_TEXT_768('snowflake-arctic-embed-m', '{safe_query}')
+               ) AS SIMILARITY
+               {', ' + extra_cols if extra_cols else ''}
+        FROM {table}
+        WHERE EMBEDDING IS NOT NULL
+        {extra_filter}
+        ORDER BY SIMILARITY DESC
+        LIMIT {limit}
+    """
+    return session.sql(sql).collect()
+
+
+# ---------------------------------------------------------------------------
+# Housing Analysts
+# ---------------------------------------------------------------------------
+
+def housing_neighborhood_analyst(query_text):
+    results = rag_query(Tables.HOUSING_NEIGHBORHOOD_SUMMARY, query_text,
+                        extra_cols="ENTITY_NAME, NEIGHBORHOOD_TIER, VALUE_SCORE")
     return [{'neighborhood': r['ENTITY_NAME'], 'tier': r['NEIGHBORHOOD_TIER'],
-             'value_score': r['VALUE_SCORE'], 'summary': r['SUMMARY_TEXT']}
-            for _, r in results.iterrows()]
+             'value_score': r['VALUE_SCORE'], 'summary': r['SUMMARY_TEXT'],
+             'similarity': float(r['SIMILARITY'])}
+            for r in results if r['SUMMARY_TEXT']]
+
+
+def housing_qa_analyst(query_text):
+    results = rag_query(Tables.HOUSING_QA_CONTEXT, query_text,
+                        extra_cols="ENTITY_NAME, ENTITY_TYPE, TIER")
+    return [{'entity': r['ENTITY_NAME'], 'type': r['ENTITY_TYPE'],
+             'tier': r['TIER'], 'summary': r['SUMMARY_TEXT'],
+             'similarity': float(r['SIMILARITY'])}
+            for r in results if r['SUMMARY_TEXT']]
 
 
 def housing_price_analyst():
@@ -296,43 +296,40 @@ def housing_building_type_analyst():
             for _, r in results.iterrows()]
 
 
-# Transportation analysts
-def transport_performance_analyst(found_line=""):
-    filter_sql = f"WHERE UPPER(ENTITY_NAME) LIKE '%{found_line}%'" if found_line else ""
-    results = session.sql(f"""
-        SELECT ENTITY_TYPE, ENTITY_NAME, TIME_PERIOD, SUMMARY_TEXT, IMPORTANCE_SCORE
-        FROM {Tables.TRANSPORT_QA_CONTEXT}
-        {filter_sql}
-        ORDER BY IMPORTANCE_SCORE DESC LIMIT 5
-    """).collect()
-    return [{'entity': r['ENTITY_NAME'], 'summary': r['SUMMARY_TEXT']}
+# ---------------------------------------------------------------------------
+# Transportation Analysts
+# ---------------------------------------------------------------------------
+
+def transport_performance_analyst(query_text, found_line=""):
+    extra = f"AND UPPER(ENTITY_NAME) LIKE '%{found_line}%'" if found_line else ""
+    results = rag_query(Tables.TRANSPORT_QA_CONTEXT, query_text,
+                        extra_cols="ENTITY_NAME, ENTITY_TYPE, TIME_PERIOD",
+                        extra_filter=extra)
+    return [{'entity': r['ENTITY_NAME'], 'type': r['ENTITY_TYPE'],
+             'period': r['TIME_PERIOD'], 'summary': r['SUMMARY_TEXT'],
+             'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
 
-def transport_reliability_analyst(found_line=""):
-    filter_sql = f"WHERE UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
-    results = session.sql(f"""
-        SELECT ROUTE_ID, RELIABILITY_PCT, RELIABILITY_GRADE, SUMMARY_TEXT
-        FROM {Tables.TRANSPORT_RELIABILITY}
-        {filter_sql}
-        ORDER BY RELIABILITY_PCT DESC LIMIT 5
-    """).collect()
+def transport_reliability_analyst(query_text, found_line=""):
+    extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
+    results = rag_query(Tables.TRANSPORT_RELIABILITY, query_text,
+                        extra_cols="ROUTE_ID, RELIABILITY_PCT, RELIABILITY_GRADE",
+                        extra_filter=extra)
     return [{'route': r['ROUTE_ID'], 'reliability_pct': r['RELIABILITY_PCT'],
-             'grade': r['RELIABILITY_GRADE'], 'summary': r['SUMMARY_TEXT']}
+             'grade': r['RELIABILITY_GRADE'], 'summary': r['SUMMARY_TEXT'],
+             'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
 
-def transport_anomaly_analyst(found_line=""):
-    filter_sql = f"WHERE UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
-    results = session.sql(f"""
-        SELECT ROUTE_ID, SERVICE_DATE, ANOMALY_TYPE, LIKELY_CAUSE, Z_SCORE, SUMMARY_TEXT
-        FROM {Tables.TRANSPORT_ANOMALY_CONTEXT}
-        {filter_sql}
-        ORDER BY ABS(Z_SCORE) DESC LIMIT 5
-    """).collect()
-    return [{'route': r['ROUTE_ID'], 'date': str(r['SERVICE_DATE']),
-             'anomaly': r['ANOMALY_TYPE'], 'cause': r['LIKELY_CAUSE'],
-             'summary': r['SUMMARY_TEXT']}
+def transport_anomaly_analyst(query_text, found_line=""):
+    extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
+    results = rag_query(Tables.TRANSPORT_ANOMALY_CONTEXT, query_text,
+                        extra_cols="ROUTE_ID, ANOMALY_TYPE, LIKELY_CAUSE, Z_SCORE",
+                        extra_filter=extra)
+    return [{'route': r['ROUTE_ID'], 'anomaly': r['ANOMALY_TYPE'],
+             'cause': r['LIKELY_CAUSE'], 'z_score': str(r['Z_SCORE']),
+             'summary': r['SUMMARY_TEXT'], 'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
 
@@ -350,15 +347,49 @@ def transport_alerts_analyst(found_line=""):
             for r in results if r['ROUTE_ID']]
 
 
-# Crime analysts
-def crime_offense_analyst():
-    results = session.sql(f"""
-        SELECT DIMENSION_VALUE AS OFFENSE_TYPE, SUMMARY_TEXT
-        FROM {Tables.CRIME_SUMMARIES}
-        WHERE SUMMARY_TYPE = 'OFFENSE'
-        LIMIT 10
-    """).collect()
-    return [{'offense_type': r['OFFENSE_TYPE'], 'summary': r['SUMMARY_TEXT']}
+def transport_weather_analyst(query_text, found_line=""):
+    extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
+    results = rag_query(Tables.TRANSPORT_WEATHER_CONTEXT, query_text,
+                        extra_cols="ROUTE_ID, WEATHER_CONDITION, AVG_TEMP_F",
+                        extra_filter=extra)
+    return [{'route': r['ROUTE_ID'], 'weather': r['WEATHER_CONDITION'],
+             'temp': str(r['AVG_TEMP_F']), 'summary': r['SUMMARY_TEXT'],
+             'similarity': float(r['SIMILARITY'])}
+            for r in results if r['SUMMARY_TEXT']]
+
+
+def transport_station_analyst(query_text, found_line=""):
+    extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
+    results = rag_query(Tables.TRANSPORT_STATION_RANKING, query_text,
+                        extra_cols="STOP_NAME, ROUTE_ID, DAYPART, EVENT_COUNT",
+                        extra_filter=extra)
+    return [{'station': r['STOP_NAME'], 'route': r['ROUTE_ID'],
+             'daypart': r['DAYPART'], 'event_count': r['EVENT_COUNT'],
+             'summary': r['SUMMARY_TEXT'], 'similarity': float(r['SIMILARITY'])}
+            for r in results if r['SUMMARY_TEXT']]
+
+
+def transport_monthly_analyst(query_text, found_line=""):
+    extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
+    results = rag_query(Tables.TRANSPORT_MONTHLY_TREND, query_text,
+                        extra_cols="ROUTE_ID, MONTH, TOTAL_EVENTS",
+                        extra_filter=extra, limit=6)
+    return [{'route': r['ROUTE_ID'], 'month': str(r['MONTH']),
+             'total_events': r['TOTAL_EVENTS'], 'summary': r['SUMMARY_TEXT'],
+             'similarity': float(r['SIMILARITY'])}
+            for r in results if r['SUMMARY_TEXT']]
+
+
+# ---------------------------------------------------------------------------
+# Crime Analysts
+# ---------------------------------------------------------------------------
+
+def crime_offense_analyst(query_text):
+    results = rag_query(Tables.CRIME_SUMMARIES, query_text,
+                        extra_cols="SUMMARY_TYPE, DIMENSION_VALUE",
+                        extra_filter="AND SUMMARY_TYPE = 'OFFENSE'")
+    return [{'offense_type': r['DIMENSION_VALUE'], 'summary': r['SUMMARY_TEXT'],
+             'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
 
@@ -404,7 +435,10 @@ def crime_shooting_analyst():
             for r in results if r['DISTRICT']]
 
 
-# Cross-branch analyst
+# ---------------------------------------------------------------------------
+# Cross-branch Analyst
+# ---------------------------------------------------------------------------
+
 def cross_branch_analyst():
     results = session.sql(f"""
         SELECT
@@ -434,11 +468,10 @@ def cross_branch_analyst():
             GROUP BY DISTRICT
         ) c ON c.DISTRICT = m.DISTRICT
         LEFT JOIN (
-            SELECT
-                snm.NEIGHBORHOOD_NAME,
-                COUNT(DISTINCT sc.STOP_NAME) AS TOTAL_STATIONS,
-                SUM(sc.EVENT_COUNT) AS TOTAL_TRANSIT_EVENTS,
-                LISTAGG(DISTINCT sc.ROUTE_ID, ', ') AS LINES_SERVED
+            SELECT snm.NEIGHBORHOOD_NAME,
+                   COUNT(DISTINCT sc.STOP_NAME) AS TOTAL_STATIONS,
+                   SUM(sc.EVENT_COUNT) AS TOTAL_TRANSIT_EVENTS,
+                   LISTAGG(DISTINCT sc.ROUTE_ID, ', ') AS LINES_SERVED
             FROM {Tables.STATION_NEIGHBORHOOD_MAP} snm
             JOIN {Tables.TRANSPORT_STATION_RANKING} sc
                 ON UPPER(sc.STOP_NAME) = UPPER(snm.STATION_NAME)
@@ -446,7 +479,6 @@ def cross_branch_analyst():
         ) t ON UPPER(t.NEIGHBORHOOD_NAME) = UPPER(m.NEIGHBORHOOD_NAME)
         ORDER BY n.VALUE_SCORE DESC
     """).collect()
-
     return [
         {
             'neighborhood':        r['NEIGHBORHOOD_NAME'],
@@ -464,31 +496,44 @@ def cross_branch_analyst():
         for r in results if r['NEIGHBORHOOD_NAME']
     ]
 
+
+# ---------------------------------------------------------------------------
+# Retrieval Node
+# ---------------------------------------------------------------------------
+
 def retrieval_node(state: CityLensState) -> CityLensState:
     branch     = state["branch"]
     intent     = state["intent"]
     entities   = state["entities"]
+    query_text = state["user_query"]
     found_line = entities.get("line", "")
 
     raw_context = {}
     total = 0
 
     if branch == "housing":
-        raw_context["neighborhood"] = housing_neighborhood_analyst()
+        raw_context["neighborhood"] = housing_neighborhood_analyst(query_text)
+        raw_context["qa_context"]   = housing_qa_analyst(query_text)
         raw_context["price"]        = housing_price_analyst()
         if intent == "building_type":
             raw_context["building_type"] = housing_building_type_analyst()
 
     elif branch == "transportation":
-        raw_context["performance"] = transport_performance_analyst(found_line)
+        raw_context["performance"] = transport_performance_analyst(query_text, found_line)
         raw_context["alerts"]      = transport_alerts_analyst(found_line)
         if intent in ["reliability", "general"]:
-            raw_context["reliability"] = transport_reliability_analyst(found_line)
+            raw_context["reliability"] = transport_reliability_analyst(query_text, found_line)
         if intent in ["anomaly", "alerts", "general"]:
-            raw_context["anomaly"] = transport_anomaly_analyst(found_line)
+            raw_context["anomaly"] = transport_anomaly_analyst(query_text, found_line)
+        if intent == "weather":
+            raw_context["weather"] = transport_weather_analyst(query_text, found_line)
+        if intent in ["station", "best_time"]:
+            raw_context["station"] = transport_station_analyst(query_text, found_line)
+        if intent == "trend":
+            raw_context["monthly"] = transport_monthly_analyst(query_text, found_line)
 
     elif branch == "crime":
-        raw_context["offense"]  = crime_offense_analyst()
+        raw_context["offense"]  = crime_offense_analyst(query_text)
         raw_context["district"] = crime_district_analyst()
         if intent == "trend":
             raw_context["trend"] = crime_trend_analyst()
@@ -516,7 +561,6 @@ BRANCH_PROMPTS = {
     "crime":          "You are a Boston Crime Intelligence Analyst specializing in public safety data.",
     "cross":          "You are a Boston Urban Intelligence Analyst with expertise in housing, transportation, and crime data.",
 }
-
 
 def synthesis_node(state: CityLensState) -> CityLensState:
     context_text = ""
@@ -572,7 +616,6 @@ def reflection_node(state: CityLensState) -> CityLensState:
         score += 30
 
     print(f"  ⭐ Reflection score: {score}/100")
-
     return {**state, "reflection_score": score, "final_answer": answer}
 
 
@@ -643,4 +686,12 @@ def run_citylens(user_query: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run_citylens("Is there a relationship between crime, housing prices, and transit accessibility?")
+    test_questions = [
+        "What are the most expensive neighborhoods in Boston?",
+        "Which MBTA line is the most reliable?",
+        "Which districts have the highest crime rates in Boston?",
+        "Where should I live in Boston?",
+    ]
+    for q in test_questions:
+        run_citylens(q)
+        print()
