@@ -42,7 +42,6 @@ DB = "CITYLENS_MERGED_DB"
 
 # Simple in-memory cache
 _query_cache = {}
-_conversation_history = []
 CACHE_MAX_SIZE = 100
 # ---------------------------------------------------------------------------
 # Table Config
@@ -106,7 +105,6 @@ class CityLensState(TypedDict):
     confidence_score: float
     sub_questions:    list
     use_multistep:    bool
-    conversation_history: list
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +827,6 @@ def synthesis_node(state: CityLensState) -> dict:
 
 Question: {state['user_query']}
 {multistep_context}
-{history_context}
 
 Data (use ONLY the data provided below):
 {context_text}
@@ -953,15 +950,11 @@ def run_citylens(user_query: str) -> str:
     print(f"❓ {user_query}")
     print('='*60)
 
-    # Cache key 包含历史轮次
-    history_key = str(len(_conversation_history))
-    cache_key = f"{history_key}:{user_query.lower().strip()}"
-
+    # Check cache
+    cache_key = user_query.lower().strip()
     if cache_key in _query_cache:
         print("  ⚡ Cache hit! Returning cached answer.")
         cached = _query_cache[cache_key]
-        _conversation_history.append({"role": "user", "content": user_query})
-        _conversation_history.append({"role": "assistant", "content": cached["answer"]})
         print(f"\n{'='*60}")
         print("🤖 FINAL ANSWER (cached):")
         print(cached["answer"])
@@ -970,40 +963,31 @@ def run_citylens(user_query: str) -> str:
         return cached["answer"]
 
     initial_state: CityLensState = {
-        "user_query":           user_query,
-        "query_id":             str(uuid.uuid4()),
-        "query_ts":             datetime.now().isoformat(),
-        "branch":               "",
-        "intent":               "",
-        "entities":             {},
-        "agent_results":        [],
-        "raw_context":          {},
-        "total_retrievals":     0,
-        "answer":               "",
-        "latency_ms":           0,
-        "reflection_score":     0,
-        "confidence_score":     0.0,
-        "final_answer":         "",
-        "sub_questions":        [],
-        "use_multistep":        False,
-        "conversation_history": _conversation_history[-4:],
+        "user_query":       user_query,
+        "query_id":         str(uuid.uuid4()),
+        "query_ts":         datetime.now().isoformat(),
+        "branch":           "",
+        "intent":           "",
+        "entities":         {},
+        "agent_results":    [],
+        "raw_context":      {},
+        "total_retrievals": 0,
+        "answer":           "",
+        "latency_ms":       0,
+        "reflection_score": 0,
+        "confidence_score": 0.0,
+        "final_answer":     "",
+        "sub_questions":    [],
+        "use_multistep":    False,
     }
 
     result = citylens_graph.invoke(initial_state)
 
-    # 更新对话历史
-    _conversation_history.append({"role": "user", "content": user_query})
-    _conversation_history.append({"role": "assistant", "content": result["final_answer"][:300]})
-
-    # 保持最多 10 轮
-    if len(_conversation_history) > 20:
-        _conversation_history = _conversation_history[-20:]
-
-    # 保存到 cache
+    # Save to cache
     if len(_query_cache) >= CACHE_MAX_SIZE:
         oldest_key = next(iter(_query_cache))
         del _query_cache[oldest_key]
-
+    
     _query_cache[cache_key] = {
         "answer":     result["final_answer"],
         "confidence": result["confidence_score"]
@@ -1027,6 +1011,5 @@ def run_citylens(user_query: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run_citylens("What are the most expensive neighborhoods in Boston?")
-    run_citylens("What about crime rates in those neighborhoods?")
-    run_citylens("And how is the transit access there?")
+    run_citylens("Where should I live in Boston?")
+    run_citylens("Is Beacon Hill a good place to buy a home?")
