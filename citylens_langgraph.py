@@ -218,7 +218,14 @@ def router_node(state: CityLensState) -> CityLensState:
     Step 4: Update state (branch/intent/entities).
            The actual Send() dispatch happens in route_to_agents().
     """
-    query = state["user_query"].lower()
+    # 如果有对话历史，把上下文融入 query 用于 branch 检测
+    if state.get("conversation_history"):
+        recent = state["conversation_history"][-2:]
+        history_text = " ".join([h["content"] for h in recent])
+        query = (state["user_query"] + " " + history_text).lower()
+    else:
+        query = state["user_query"].lower()
+
 
     # --- Branch detection via keyword scoring ---
     housing_score   = sum(1 for k in HOUSING_KEYWORDS   if k in query)
@@ -787,14 +794,25 @@ BRANCH_PROMPTS = {
     "crime":          "You are a Boston Crime Intelligence Analyst specializing in public safety data.",
     "cross":          "You are a Boston Urban Intelligence Analyst with expertise in housing, transportation, and crime data.",
 }
+def compress_item(item: dict) -> dict:
+    exclude_keys = {'summary', 'similarity', 'housing_summary'}
+    return {k: v for k, v in item.items() if k not in exclude_keys}
 
 def synthesis_node(state: CityLensState) -> dict:
     context_text = ""
     for analyst_name, items in state["raw_context"].items():
         context_text += f"\n=== {analyst_name.upper()} ===\n"
         for item in items:
-            context_text += json.dumps(item, default=safe_serialize) + "\n"
-    context_text = context_text[:8000]
+            context_text += json.dumps(compress_item(item), default=safe_serialize) + "\n"
+    context_text = context_text[:12000]
+    
+    history_context = ""
+    if state.get("conversation_history") and len(state["conversation_history"]) > 0:
+        history_context = "\n\nPrevious conversation:\n"
+        for h in state["conversation_history"][-4:]:
+            role_label = "User" if h["role"] == "user" else "Assistant"
+            history_context += f"{role_label}: {h['content'][:150]}\n"
+        history_context += "\n"
 
     role = BRANCH_PROMPTS.get(state["branch"], "You are a Boston city intelligence analyst.")
     
@@ -923,7 +941,11 @@ print("✅ LangGraph parallel multi-agent compiled successfully!")
 # Main Entry Point
 # ---------------------------------------------------------------------------
 
+
+
 def run_citylens(user_query: str) -> str:
+    global _conversation_history
+
     print(f"\n{'='*60}")
     print(f"❓ {user_query}")
     print('='*60)
@@ -981,6 +1003,7 @@ def run_citylens(user_query: str) -> str:
     print(f"🌿 Branch     : {result['branch']}")
 
     return result["final_answer"]
+
 
 
 # ---------------------------------------------------------------------------
