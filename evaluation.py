@@ -129,6 +129,9 @@ GROUND_TRUTH = {
 # =============================================================================
 
 def run_v1_no_rag_no_router(query: str) -> dict:
+    from citylens_langgraph import _query_cache, _conversation_history
+    _query_cache.clear()
+    _conversation_history.clear()
     """
     Version 1: Simulates original Notebook.
     - No Router: always pulls Housing data regardless of question
@@ -167,6 +170,9 @@ Give a brief answer."""
 
 
 def run_v2_rag_sequential(query: str) -> dict:
+    from citylens_langgraph import _query_cache, _conversation_history
+    _query_cache.clear()
+    _conversation_history.clear()
     """
     Version 2: Simulates first LangGraph version.
     - Has Router: simple keyword-based branch detection
@@ -227,6 +233,10 @@ Give a structured answer with specific numbers."""
 
 
 def run_v3_full_system(query: str) -> dict:
+    # 清空缓存和对话历史，确保每次都跑完整 pipeline
+    from citylens_langgraph import _query_cache, _conversation_history
+    _query_cache.clear()
+    _conversation_history.clear()
     """
     Version 3: Current full system.
     - Parallel multi-agent (Housing + Transport + Crime simultaneously)
@@ -264,7 +274,8 @@ def run_v3_full_system(query: str) -> dict:
         "answer":    result["final_answer"],
         "latency":   latency,
         "retrievals": result["total_retrievals"],
-        "branch":    result["branch"]
+        "branch":    result["branch"],
+        "confidence": result["confidence_score"] 
     }
 
 
@@ -647,6 +658,15 @@ def generate_report(ablation_results, retrieval_results, bleu_rouge_results,
         v2l = row["v2"]["latency"]
         v3l = row["v3"]["latency"]
         lines.append(f"| {q} | {v1l} | {v2l} | {v3l} |")
+    lines.append("")
+    
+    lines.append("### Confidence Score (V3 only)\n")
+    lines.append("| Question | Confidence |")
+    lines.append("|----------|------------|")
+    for row in ablation_results:
+        q = row["query"][:50] + "..." if len(row["query"]) > 50 else row["query"]
+        conf = row["v3"].get("confidence", "N/A")
+        lines.append(f"| {q} | {conf} |")
     lines.append("")
 
     # Retrieval comparison
