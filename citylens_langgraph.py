@@ -1,17 +1,29 @@
 # =============================================================================
-# CityLens — LangGraph Multi-Agent Pipeline (Full RAG Version)
+# CityLens — LangGraph Parallel Multi-Agent Pipeline
 # =============================================================================
-# All analysts now use vector similarity search (EMBED_TEXT_768)
-# instead of fixed ORDER BY queries.
+# Architecture:
+#
+#   User Query
+#       ↓
+#   [Router Node]          — keyword detection → branch + intent + entities
+#       ↓ Send() API
+#   [Housing Agent]  ──┐
+#   [Transport Agent]──┼→  [Aggregator Node] → [Synthesis Node] → [Reflection Node]
+#   [Crime Agent]    ──┘
+#
+# For single-branch queries, only the relevant agent runs.
+# For cross-branch queries, all three agents run in parallel.
 # =============================================================================
 
 import json
 import uuid
 import time
-from typing import TypedDict
+import operator
+from typing import TypedDict, Annotated
 from datetime import datetime
 
 from langgraph.graph import StateGraph, END
+from langgraph.types import Send
 from snowflake.snowpark import Session
 
 from snowflake_config import SNOWFLAKE_CONN
@@ -48,7 +60,6 @@ class Tables:
     TRANSPORT_RELIABILITY        = f"{DB}.CITYLENS_SERVING.SRV_ROUTE_RELIABILITY"
     TRANSPORT_MONTHLY_TREND      = f"{DB}.CITYLENS_SERVING.SRV_MONTHLY_TREND"
     TRANSPORT_STATION_RANKING    = f"{DB}.CITYLENS_SERVING.SRV_STATION_RISK_RANKING"
-    TRANSPORT_ROUTE_CONTEXT      = f"{DB}.CITYLENS_SERVING.SRV_ROUTE_CONTEXT"
     TRANSPORT_ALERTS_SUMMARY     = f"{DB}.CITYLENS_MART.MART_ALERTS_SUMMARY"
     TRANSPORT_DAYPART            = f"{DB}.CITYLENS_SERVING.SRV_DAYPART_PERFORMANCE"
     TRANSPORT_DAYOFWEEK          = f"{DB}.CITYLENS_SERVING.SRV_DAYOFWEEK_PERFORMANCE"
@@ -68,6 +79,10 @@ class Tables:
 # ---------------------------------------------------------------------------
 # LangGraph State
 # ---------------------------------------------------------------------------
+# agent_results uses Annotated[list, operator.add] so that multiple parallel
+# agents can each append their results without overwriting each other.
+# operator.add merges all lists: [housing_result] + [transport_result] + [crime_result]
+# ---------------------------------------------------------------------------
 
 class CityLensState(TypedDict):
     user_query:       str
@@ -76,7 +91,8 @@ class CityLensState(TypedDict):
     branch:           str
     intent:           str
     entities:         dict
-    raw_context:      dict
+    agent_results:    Annotated[list, operator.add]  # parallel agents write here
+    raw_context:      dict                           # aggregator consolidates here
     total_retrievals: int
     answer:           str
     latency_ms:       int
@@ -85,37 +101,123 @@ class CityLensState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
+# Keyword Lists (used by Router Node)
+# ---------------------------------------------------------------------------
+# These keyword lists determine which branch a query belongs to.
+# Each word/phrase is checked with `if keyword in query_lower`.
+
+HOUSING_KEYWORDS = [
+    # Property types
+    'neighborhood', 'property', 'housing', 'home', 'house',
+    'condo', 'apartment', 'rent', 'bedroom', 'sqft', 'price per sqft',
+    # Boston neighborhoods
+    'allston', 'back bay', 'beacon hill', 'brighton', 'charlestown',
+    'chinatown', 'dorchester', 'downtown', 'east boston', 'fenway',
+    'hyde park', 'jamaica plain', 'longwood', 'mattapan', 'mission hill',
+    'north end', 'roslindale', 'roxbury', 'south boston', 'south end',
+    'west end', 'west roxbury', 'waterfront',
+    # Price-related
+    'zipcode', 'zip code', 'affordable', 'expensive', 'luxury',
+    'property value', 'home value', 'real estate', 'buy a home',
+]
+
+TRANSPORT_KEYWORDS = [
+    # System names
+    'mbta', 'train', 'subway', 'transit', 'commute',
+    # Line names
+    'blue line', 'red line', 'green line', 'orange line', 'silver line',
+    'blue', 'red line', 'green', 'orange', 'silver',
+    # Concepts
+    'station', 'stop', 'route', 'line', 'bus', 'rail',
+    'delay', 'alert', 'reliability', 'on time', 'schedule',
+    'crowded', 'rush hour', 'commuter', 'ridership',
+    'travel time', 'headway', 'frequency',
+]
+
+CRIME_KEYWORDS = [
+    # Crime types
+    'crime', 'shooting', 'robbery', 'assault', 'burglary',
+    'larceny', 'fraud', 'vandalism', 'trespassing', 'theft',
+    # Concepts
+    'arrest', 'offense', 'incident', 'police', 'weapon',
+    'dangerous', 'violence', 'homicide', 'drug',
+    # Safety
+    'safe', 'safety', 'unsafe', 'risk',
+    # Geography
+    'district', 'b2', 'b3', 'c11', 'd4', 'a1', 'a7',
+]
+
+CROSS_KEYWORDS = [
+    # Comparison/relationship
+    'compare', 'correlation', 'relationship', 'between',
+    'affect', 'impact', 'vs', 'versus', 'connection',
+    'link', 'relate', 'associated', 'influence', 'effect',
+    # Combined domains
+    'and crime', 'and housing', 'and transit',
+    'crime and', 'housing and', 'transit and',
+    # Living recommendations
+    'where should i live', 'best place to live', 'where to live',
+    'should i move', 'best neighborhood', 'recommend', 'ideal area',
+    'good place to live', 'where to buy',
+    # Price + safety combos
+    'high pricing', 'expensive area', 'price and crime',
+    'affordable and safe', 'cheap and safe', 'value and safety',
+    'does price', 'how does price', 'does the', 'will have',
+    'low crime', 'high crime', 'price crime',
+    # Quality of life
+    'livability', 'quality of life', 'best of both',
+    'overall', 'trade off', 'pros and cons',
+    # Transit + housing combos
+    'near transit', 'good commute', 'transit access',
+    'commute and housing', 'commute and neighborhood',
+]
+
+# Intent keywords per branch
+HOUSING_INTENT_KEYWORDS = {
+    'ranking_high':  ['expensive', 'luxury', 'highest', 'top', 'most valuable', 'priciest'],
+    'ranking_low':   ['affordable', 'cheap', 'cheapest', 'lowest', 'least expensive', 'budget'],
+    'comparison':    ['compare', 'vs', 'versus', 'difference', 'between'],
+    'zipcode':       ['zip', 'zipcode', 'zip code'],
+    'building_type': ['condo', 'single family', 'building type', 'apartment', 'two family'],
+}
+
+TRANSPORT_INTENT_KEYWORDS = {
+    'best_time':   ['best time', 'avoid crowd', 'quiet', 'when to ride', 'least busy'],
+    'reliability': ['reliable', 'reliability', 'unreliable', 'on time', 'consistent'],
+    'trend':       ['trend', 'month', 'over time', 'monthly', 'trending'],
+    'weather':     ['weather', 'rain', 'snow', 'storm', 'cold'],
+    'alerts':      ['alert', 'delay', 'disruption', 'issue', 'problem', 'service change'],
+    'station':     ['station', 'stop', 'busy', 'crowded', 'platform'],
+}
+
+CRIME_INTENT_KEYWORDS = {
+    'trend':    ['trend', 'month', 'year', 'over time', 'increase', 'decrease'],
+    'shooting': ['shoot', 'gun', 'firearm', 'weapon', 'shooting'],
+    'district': ['district', 'area', 'where', 'safest', 'most dangerous', 'location'],
+    'time':     ['time', 'hour', 'when', 'day', 'night', 'morning', 'peak'],
+    'policy':   ['policy', 'program', 'strategy', 'initiative', 'law'],
+}
+
+
+# ---------------------------------------------------------------------------
 # Node 1: Router
 # ---------------------------------------------------------------------------
 
 def router_node(state: CityLensState) -> CityLensState:
+    """
+    Step 1: Detect branch using keyword scoring.
+    Step 2: Detect intent within branch.
+    Step 3: Extract named entities (MBTA line, neighborhood).
+    Step 4: Update state (branch/intent/entities).
+           The actual Send() dispatch happens in route_to_agents().
+    """
     query = state["user_query"].lower()
 
-    housing_keywords   = ['neighborhood', 'property', 'housing', 'home', 'house',
-                          'condo', 'apartment', 'rent', 'price per sqft', 'bedroom',
-                          'allston', 'back bay', 'beacon hill', 'dorchester',
-                          'south boston', 'roxbury', 'fenway', 'zipcode', 'zip code']
-    transport_keywords = ['mbta', 'train', 'subway', 'line', 'station', 'transit',
-                          'blue line', 'red line', 'green line', 'orange line',
-                          'commute', 'delay', 'alert', 'reliability', 'route']
-    crime_keywords     = ['crime', 'shooting', 'robbery', 'assault', 'burglary',
-                          'larceny', 'fraud', 'arrest', 'district', 'safe', 'dangerous',
-                          'offense', 'incident', 'police', 'weapon']
-    cross_keywords     = ['compare', 'correlation', 'relationship', 'between',
-                          'affect', 'impact', 'vs', 'versus', 'and crime',
-                          'and housing', 'and transit', 'neighborhood safety',
-                          'livability', 'relate', 'connection', 'how does',
-                          'where should i live', 'best place to live',
-                          'where to live', 'should i move', 'high pricing',
-                          'expensive area', 'price and crime', 'pricing area',
-                          'low crime', 'high crime', 'does the', 'will have',
-                          'best of both', 'overall', 'quality of life',
-                          'price crime', 'pricing and crime']
-
-    housing_score   = sum(1 for k in housing_keywords   if k in query)
-    transport_score = sum(1 for k in transport_keywords  if k in query)
-    crime_score     = sum(1 for k in crime_keywords      if k in query)
-    cross_score     = sum(1 for k in cross_keywords      if k in query)
+    # --- Branch detection via keyword scoring ---
+    housing_score   = sum(1 for k in HOUSING_KEYWORDS   if k in query)
+    transport_score = sum(1 for k in TRANSPORT_KEYWORDS  if k in query)
+    crime_score     = sum(1 for k in CRIME_KEYWORDS      if k in query)
+    cross_score     = sum(1 for k in CROSS_KEYWORDS      if k in query)
 
     scores = {
         'housing':        housing_score,
@@ -123,7 +225,7 @@ def router_node(state: CityLensState) -> CityLensState:
         'crime':          crime_score,
     }
 
-    # Forced cross rules
+    # Forced cross rules (explicit domain combinations)
     if ('price' in query or 'pricing' in query or 'expensive' in query or 'cheap' in query) and \
        ('crime' in query or 'safe' in query or 'dangerous' in query):
         branch = 'cross'
@@ -137,67 +239,49 @@ def router_node(state: CityLensState) -> CityLensState:
     else:
         branch = max(scores, key=scores.get)
         if scores[branch] == 0:
-            branch = 'cross'
+            branch = 'cross'  # fallback: unknown queries get all data
 
-    # Intent detection
+    # --- Intent detection ---
     if branch == 'housing':
-        if any(w in query for w in ['expensive', 'luxury', 'highest', 'top']):
-            intent = 'ranking_high'
-        elif any(w in query for w in ['affordable', 'cheap', 'lowest']):
-            intent = 'ranking_low'
-        elif any(w in query for w in ['compare', 'vs', 'versus']):
-            intent = 'comparison'
-        elif any(w in query for w in ['zip', 'zipcode']):
-            intent = 'zipcode'
-        elif any(w in query for w in ['condo', 'single family', 'building type']):
-            intent = 'building_type'
-        else:
-            intent = 'general'
+        intent = 'general'
+        for intent_name, keywords in HOUSING_INTENT_KEYWORDS.items():
+            if any(k in query for k in keywords):
+                intent = intent_name
+                break
 
     elif branch == 'transportation':
-        if any(w in query for w in ['best time', 'avoid crowd', 'quiet']):
-            intent = 'best_time'
-        elif any(w in query for w in ['reliable', 'reliability', 'unreliable']):
-            intent = 'reliability'
-        elif any(w in query for w in ['trend', 'month']):
-            intent = 'trend'
-        elif any(w in query for w in ['weather', 'rain', 'snow']):
-            intent = 'weather'
-        elif any(w in query for w in ['alert', 'delay', 'disruption']):
-            intent = 'alerts'
-        elif any(w in query for w in ['station', 'stop', 'busy']):
-            intent = 'station'
-        else:
-            intent = 'general'
+        intent = 'general'
+        for intent_name, keywords in TRANSPORT_INTENT_KEYWORDS.items():
+            if any(k in query for k in keywords):
+                intent = intent_name
+                break
 
     elif branch == 'crime':
-        if any(w in query for w in ['trend', 'month', 'year', 'over time']):
-            intent = 'trend'
-        elif any(w in query for w in ['shoot', 'gun']):
-            intent = 'shooting'
-        elif any(w in query for w in ['district', 'area', 'where', 'safest']):
-            intent = 'district'
-        elif any(w in query for w in ['time', 'hour', 'when', 'day']):
-            intent = 'time'
-        elif any(w in query for w in ['policy', 'program']):
-            intent = 'policy'
-        else:
-            intent = 'offense'
+        intent = 'offense'
+        for intent_name, keywords in CRIME_INTENT_KEYWORDS.items():
+            if any(k in query for k in keywords):
+                intent = intent_name
+                break
 
     else:
         intent = 'general'
 
-    # Entity extraction
+    # --- Entity extraction ---
     entities = {}
+
+    # MBTA line detection
     for line in ['BLUE', 'RED', 'GREEN', 'ORANGE', 'SILVER']:
         if line.lower() in query:
             entities['line'] = line
             break
 
-    neighborhoods = ['allston', 'back bay', 'beacon hill', 'brighton', 'charlestown',
-                     'dorchester', 'downtown', 'east boston', 'fenway', 'hyde park',
-                     'jamaica plain', 'mattapan', 'north end', 'roslindale', 'roxbury',
-                     'south boston', 'south end', 'west roxbury']
+    # Neighborhood detection
+    neighborhoods = [
+        'allston', 'back bay', 'beacon hill', 'brighton', 'charlestown',
+        'chinatown', 'dorchester', 'downtown', 'east boston', 'fenway',
+        'hyde park', 'jamaica plain', 'mattapan', 'north end', 'roslindale',
+        'roxbury', 'south boston', 'south end', 'west end', 'west roxbury'
+    ]
     for n in neighborhoods:
         if n in query:
             entities['neighborhood'] = n
@@ -206,12 +290,46 @@ def router_node(state: CityLensState) -> CityLensState:
     print(f"  🔀 Branch   : {branch}")
     print(f"  🎯 Intent   : {intent}")
     print(f"  📍 Entities : {entities}")
+    print(f"  📊 Scores   : housing={housing_score} transport={transport_score} crime={crime_score} cross={cross_score}")
 
-    return {**state, "branch": branch, "intent": intent, "entities": entities}
+    return {**state, "branch": branch, "intent": intent, "entities": entities,
+            "agent_results": []}
 
 
 # ---------------------------------------------------------------------------
-# Node 2: Retrieval — All analysts use RAG
+# route_to_agents: decides which agents to Send() based on branch
+# ---------------------------------------------------------------------------
+
+def route_to_agents(state: CityLensState):
+    """
+    Called as a conditional edge from router_node.
+    Returns a list of Send() objects telling LangGraph which agents to run.
+    
+    Single branch → 1 Send  (only relevant agent runs)
+    Cross branch  → 3 Sends (all three agents run IN PARALLEL)
+    """
+    branch = state["branch"]
+
+    if branch == "housing":
+        return [Send("housing_agent", state)]
+
+    elif branch == "transportation":
+        return [Send("transport_agent", state)]
+
+    elif branch == "crime":
+        return [Send("crime_agent", state)]
+
+    else:  # cross or general
+        # All three agents run simultaneously
+        return [
+            Send("housing_agent",   state),
+            Send("transport_agent", state),
+            Send("crime_agent",     state),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# RAG Helper
 # ---------------------------------------------------------------------------
 
 def safe_serialize(obj):
@@ -240,7 +358,7 @@ def rag_query(table, query_text, extra_cols="", extra_filter="", limit=8):
 
 
 # ---------------------------------------------------------------------------
-# Housing Analysts
+# Housing Analyst Functions
 # ---------------------------------------------------------------------------
 
 def housing_neighborhood_analyst(query_text):
@@ -251,7 +369,6 @@ def housing_neighborhood_analyst(query_text):
              'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
-
 def housing_qa_analyst(query_text):
     results = rag_query(Tables.HOUSING_QA_CONTEXT, query_text,
                         extra_cols="ENTITY_NAME, ENTITY_TYPE, TIER")
@@ -259,7 +376,6 @@ def housing_qa_analyst(query_text):
              'tier': r['TIER'], 'summary': r['SUMMARY_TEXT'],
              'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
-
 
 def housing_price_analyst():
     results = session.sql(f"""
@@ -272,7 +388,6 @@ def housing_price_analyst():
     return [{'type': r['EXCEPTION_TYPE'], 'neighborhood': r['NEIGHBORHOOD_NAME'],
              'avg_value': r['AVG_PROPERTY_VALUE'], 'rank': r['RANK']}
             for _, r in results.iterrows()]
-
 
 def housing_building_type_analyst():
     results = session.sql(f"""
@@ -297,7 +412,7 @@ def housing_building_type_analyst():
 
 
 # ---------------------------------------------------------------------------
-# Transportation Analysts
+# Transportation Analyst Functions
 # ---------------------------------------------------------------------------
 
 def transport_performance_analyst(query_text, found_line=""):
@@ -310,7 +425,6 @@ def transport_performance_analyst(query_text, found_line=""):
              'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
-
 def transport_reliability_analyst(query_text, found_line=""):
     extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
     results = rag_query(Tables.TRANSPORT_RELIABILITY, query_text,
@@ -321,7 +435,6 @@ def transport_reliability_analyst(query_text, found_line=""):
              'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
-
 def transport_anomaly_analyst(query_text, found_line=""):
     extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
     results = rag_query(Tables.TRANSPORT_ANOMALY_CONTEXT, query_text,
@@ -331,7 +444,6 @@ def transport_anomaly_analyst(query_text, found_line=""):
              'cause': r['LIKELY_CAUSE'], 'z_score': str(r['Z_SCORE']),
              'summary': r['SUMMARY_TEXT'], 'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
-
 
 def transport_alerts_analyst(found_line=""):
     filter_sql = f"WHERE UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
@@ -346,7 +458,6 @@ def transport_alerts_analyst(found_line=""):
              'effect': r['EFFECT'], 'total_alerts': int(r['TOTAL_ALERTS'])}
             for r in results if r['ROUTE_ID']]
 
-
 def transport_weather_analyst(query_text, found_line=""):
     extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
     results = rag_query(Tables.TRANSPORT_WEATHER_CONTEXT, query_text,
@@ -357,7 +468,6 @@ def transport_weather_analyst(query_text, found_line=""):
              'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
-
 def transport_station_analyst(query_text, found_line=""):
     extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
     results = rag_query(Tables.TRANSPORT_STATION_RANKING, query_text,
@@ -367,7 +477,6 @@ def transport_station_analyst(query_text, found_line=""):
              'daypart': r['DAYPART'], 'event_count': r['EVENT_COUNT'],
              'summary': r['SUMMARY_TEXT'], 'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
-
 
 def transport_monthly_analyst(query_text, found_line=""):
     extra = f"AND UPPER(ROUTE_ID) LIKE '%{found_line}%'" if found_line else ""
@@ -381,7 +490,7 @@ def transport_monthly_analyst(query_text, found_line=""):
 
 
 # ---------------------------------------------------------------------------
-# Crime Analysts
+# Crime Analyst Functions
 # ---------------------------------------------------------------------------
 
 def crime_offense_analyst(query_text):
@@ -391,7 +500,6 @@ def crime_offense_analyst(query_text):
     return [{'offense_type': r['DIMENSION_VALUE'], 'summary': r['SUMMARY_TEXT'],
              'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
-
 
 def crime_district_analyst():
     results = session.sql(f"""
@@ -408,7 +516,6 @@ def crime_district_analyst():
              'most_common_offense': r['MOST_COMMON_OFFENSE']}
             for r in results if r['DISTRICT']]
 
-
 def crime_trend_analyst():
     results = session.sql(f"""
         SELECT TO_CHAR(MONTH_DATE, 'YYYY-MM') AS MONTH, TOTAL_CRIME
@@ -417,7 +524,6 @@ def crime_trend_analyst():
     """).collect()
     return [{'month': r['MONTH'], 'total_crime': int(r['TOTAL_CRIME'])}
             for r in results]
-
 
 def crime_shooting_analyst():
     results = session.sql(f"""
@@ -436,7 +542,7 @@ def crime_shooting_analyst():
 
 
 # ---------------------------------------------------------------------------
-# Cross-branch Analyst
+# Cross-branch Analyst (neighborhood + district + station mapping)
 # ---------------------------------------------------------------------------
 
 def cross_branch_analyst():
@@ -498,61 +604,132 @@ def cross_branch_analyst():
 
 
 # ---------------------------------------------------------------------------
-# Retrieval Node
+# Node 2a: Housing Agent
 # ---------------------------------------------------------------------------
 
-def retrieval_node(state: CityLensState) -> CityLensState:
-    branch     = state["branch"]
-    intent     = state["intent"]
-    entities   = state["entities"]
+def housing_agent_node(state: CityLensState) -> dict:
+    """
+    Runs all housing-related analysts.
+    Returns results in agent_results list.
+    operator.add merges this with other agents' results.
+    """
     query_text = state["user_query"]
-    found_line = entities.get("line", "")
+    intent     = state["intent"]
 
+    data = {}
+    data["neighborhood"] = housing_neighborhood_analyst(query_text)
+    data["qa_context"]   = housing_qa_analyst(query_text)
+    data["price"]        = housing_price_analyst()
+
+    if intent == "building_type":
+        data["building_type"] = housing_building_type_analyst()
+
+    total = sum(len(v) for v in data.values())
+    print(f"  🏠 Housing agent done: {total} items")
+
+    return {"agent_results": [{"branch": "housing", "data": data}]}
+
+
+# ---------------------------------------------------------------------------
+# Node 2b: Transport Agent
+# ---------------------------------------------------------------------------
+
+def transport_agent_node(state: CityLensState) -> dict:
+    """
+    Runs all transportation-related analysts.
+    Returns results in agent_results list.
+    """
+    query_text = state["user_query"]
+    intent     = state["intent"]
+    found_line = state["entities"].get("line", "")
+
+    data = {}
+    data["performance"] = transport_performance_analyst(query_text, found_line)
+    data["alerts"]      = transport_alerts_analyst(found_line)
+
+    if intent in ["reliability", "general"]:
+        data["reliability"] = transport_reliability_analyst(query_text, found_line)
+    if intent in ["anomaly", "alerts", "general"]:
+        data["anomaly"] = transport_anomaly_analyst(query_text, found_line)
+    if intent == "weather":
+        data["weather"] = transport_weather_analyst(query_text, found_line)
+    if intent in ["station", "best_time"]:
+        data["station"] = transport_station_analyst(query_text, found_line)
+    if intent == "trend":
+        data["monthly"] = transport_monthly_analyst(query_text, found_line)
+
+    total = sum(len(v) for v in data.values())
+    print(f"  🚇 Transport agent done: {total} items")
+
+    return {"agent_results": [{"branch": "transportation", "data": data}]}
+
+
+# ---------------------------------------------------------------------------
+# Node 2c: Crime Agent
+# ---------------------------------------------------------------------------
+
+def crime_agent_node(state: CityLensState) -> dict:
+    """
+    Runs all crime-related analysts.
+    Returns results in agent_results list.
+    """
+    query_text = state["user_query"]
+    intent     = state["intent"]
+
+    data = {}
+    data["offense"]  = crime_offense_analyst(query_text)
+    data["district"] = crime_district_analyst()
+
+    if intent == "trend":
+        data["trend"] = crime_trend_analyst()
+    if intent == "shooting":
+        data["shooting"] = crime_shooting_analyst()
+
+    total = sum(len(v) for v in data.values())
+    print(f"  🚨 Crime agent done: {total} items")
+
+    return {"agent_results": [{"branch": "crime", "data": data}]}
+
+
+# ---------------------------------------------------------------------------
+# Node 3: Aggregator
+# ---------------------------------------------------------------------------
+
+def aggregator_node(state: CityLensState) -> dict:
+    """
+    Collects results from all parallel agents (via agent_results).
+    Consolidates into raw_context for Synthesis node.
+    For cross-branch queries, also runs cross_branch_analyst()
+    to add the neighborhood-district-station mapping data.
+    """
     raw_context = {}
     total = 0
 
-    if branch == "housing":
-        raw_context["neighborhood"] = housing_neighborhood_analyst(query_text)
-        raw_context["qa_context"]   = housing_qa_analyst(query_text)
-        raw_context["price"]        = housing_price_analyst()
-        if intent == "building_type":
-            raw_context["building_type"] = housing_building_type_analyst()
+    # agent_results is a list like:
+    # [{"branch": "housing", "data": {...}},
+    #  {"branch": "transportation", "data": {...}},
+    #  {"branch": "crime", "data": {...}}]
+    for agent_result in state["agent_results"]:
+        branch = agent_result["branch"]
+        data   = agent_result["data"]
+        for key, items in data.items():
+            # prefix with branch name to avoid key collisions
+            raw_context[f"{branch}_{key}"] = items
+            total += len(items)
+            print(f"  📊 {branch}/{key}: {len(items)} items")
 
-    elif branch == "transportation":
-        raw_context["performance"] = transport_performance_analyst(query_text, found_line)
-        raw_context["alerts"]      = transport_alerts_analyst(found_line)
-        if intent in ["reliability", "general"]:
-            raw_context["reliability"] = transport_reliability_analyst(query_text, found_line)
-        if intent in ["anomaly", "alerts", "general"]:
-            raw_context["anomaly"] = transport_anomaly_analyst(query_text, found_line)
-        if intent == "weather":
-            raw_context["weather"] = transport_weather_analyst(query_text, found_line)
-        if intent in ["station", "best_time"]:
-            raw_context["station"] = transport_station_analyst(query_text, found_line)
-        if intent == "trend":
-            raw_context["monthly"] = transport_monthly_analyst(query_text, found_line)
+    # For cross-branch: add neighborhood mapping data
+    if state["branch"] == "cross":
+        cross_data = cross_branch_analyst()
+        raw_context["cross_mapping"] = cross_data
+        total += len(cross_data)
+        print(f"  🔀 Cross mapping: {len(cross_data)} neighborhoods")
 
-    elif branch == "crime":
-        raw_context["offense"]  = crime_offense_analyst(query_text)
-        raw_context["district"] = crime_district_analyst()
-        if intent == "trend":
-            raw_context["trend"] = crime_trend_analyst()
-        if intent == "shooting":
-            raw_context["shooting"] = crime_shooting_analyst()
-
-    elif branch == "cross":
-        raw_context["cross_analysis"] = cross_branch_analyst()
-        print(f"  📊 Cross-branch: {len(raw_context['cross_analysis'])} neighborhoods matched")
-
-    for items in raw_context.values():
-        total += len(items)
-        print(f"  📊 Retrieved {len(items)} items")
-
-    return {**state, "raw_context": raw_context, "total_retrievals": total}
+    return {"raw_context": raw_context, "total_retrievals": total}
 
 
 # ---------------------------------------------------------------------------
-# Node 3: Synthesis
+# Node 4: Synthesis
 # ---------------------------------------------------------------------------
 
 BRANCH_PROMPTS = {
@@ -562,7 +739,7 @@ BRANCH_PROMPTS = {
     "cross":          "You are a Boston Urban Intelligence Analyst with expertise in housing, transportation, and crime data.",
 }
 
-def synthesis_node(state: CityLensState) -> CityLensState:
+def synthesis_node(state: CityLensState) -> dict:
     context_text = ""
     for analyst_name, items in state["raw_context"].items():
         context_text += f"\n=== {analyst_name.upper()} ===\n"
@@ -593,14 +770,14 @@ Structure your answer as:
     latency_ms = int((time.time() - start_time) * 1000)
     answer = result[0]['ANSWER']
 
-    return {**state, "answer": answer, "latency_ms": latency_ms}
+    return {"answer": answer, "latency_ms": latency_ms}
 
 
 # ---------------------------------------------------------------------------
-# Node 4: Reflection
+# Node 5: Reflection
 # ---------------------------------------------------------------------------
 
-def reflection_node(state: CityLensState) -> CityLensState:
+def reflection_node(state: CityLensState) -> dict:
     answer = state["answer"]
     score  = 0
 
@@ -616,7 +793,7 @@ def reflection_node(state: CityLensState) -> CityLensState:
         score += 30
 
     print(f"  ⭐ Reflection score: {score}/100")
-    return {**state, "reflection_score": score, "final_answer": answer}
+    return {"reflection_score": score, "final_answer": answer}
 
 
 # ---------------------------------------------------------------------------
@@ -626,22 +803,40 @@ def reflection_node(state: CityLensState) -> CityLensState:
 def build_graph():
     graph = StateGraph(CityLensState)
 
-    graph.add_node("router",     router_node)
-    graph.add_node("retrieval",  retrieval_node)
-    graph.add_node("synthesis",  synthesis_node)
-    graph.add_node("reflection", reflection_node)
+    # Register all nodes
+    graph.add_node("router",          router_node)
+    graph.add_node("housing_agent",   housing_agent_node)
+    graph.add_node("transport_agent", transport_agent_node)
+    graph.add_node("crime_agent",     crime_agent_node)
+    graph.add_node("aggregator",      aggregator_node)
+    graph.add_node("synthesis",       synthesis_node)
+    graph.add_node("reflection",      reflection_node)
 
+    # Entry point
     graph.set_entry_point("router")
-    graph.add_edge("router",     "retrieval")
-    graph.add_edge("retrieval",  "synthesis")
-    graph.add_edge("synthesis",  "reflection")
-    graph.add_edge("reflection", END)
+
+    # Router → agents (conditional parallel dispatch via Send)
+    graph.add_conditional_edges(
+        "router",
+        route_to_agents,
+        ["housing_agent", "transport_agent", "crime_agent"]
+    )
+
+    # All agents → aggregator
+    graph.add_edge("housing_agent",   "aggregator")
+    graph.add_edge("transport_agent", "aggregator")
+    graph.add_edge("crime_agent",     "aggregator")
+
+    # Linear flow after aggregation
+    graph.add_edge("aggregator",  "synthesis")
+    graph.add_edge("synthesis",   "reflection")
+    graph.add_edge("reflection",  END)
 
     return graph.compile()
 
 
 citylens_graph = build_graph()
-print("✅ LangGraph compiled successfully!")
+print("✅ LangGraph parallel multi-agent compiled successfully!")
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +855,7 @@ def run_citylens(user_query: str) -> str:
         "branch":           "",
         "intent":           "",
         "entities":         {},
+        "agent_results":    [],
         "raw_context":      {},
         "total_retrievals": 0,
         "answer":           "",
