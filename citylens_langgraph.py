@@ -621,7 +621,8 @@ def housing_agent_node(state: CityLensState) -> dict:
     data["qa_context"]   = housing_qa_analyst(query_text)
     data["price"]        = housing_price_analyst()
 
-    if intent == "building_type":
+    query_lower = state["user_query"].lower()
+    if intent == "building_type" or any(w in query_lower for w in ['condo', 'single family', 'two family']):
         data["building_type"] = housing_building_type_analyst()
 
     total = sum(len(v) for v in data.values())
@@ -745,7 +746,7 @@ def synthesis_node(state: CityLensState) -> dict:
         context_text += f"\n=== {analyst_name.upper()} ===\n"
         for item in items:
             context_text += json.dumps(item, default=safe_serialize) + "\n"
-    context_text = context_text[:5000]
+    context_text = context_text[:8000]
 
     role = BRANCH_PROMPTS.get(state["branch"], "You are a Boston city intelligence analyst.")
 
@@ -882,12 +883,4 @@ def run_citylens(user_query: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    test_questions = [
-        "What are the most expensive neighborhoods in Boston?",
-        "Which MBTA line is the most reliable?",
-        "Which districts have the highest crime rates in Boston?",
-        "Where should I live in Boston?",
-    ]
-    for q in test_questions:
-        run_citylens(q)
-        print()
+    run_citylens("How do condos compare to single family homes in Boston?")
