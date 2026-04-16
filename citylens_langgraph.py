@@ -39,6 +39,10 @@ print(f"   Warehouse : {session.get_current_warehouse()}")
 
 DB = "CITYLENS_MERGED_DB"
 
+
+# Simple in-memory cache
+_query_cache = {}
+CACHE_MAX_SIZE = 100
 # ---------------------------------------------------------------------------
 # Table Config
 # ---------------------------------------------------------------------------
@@ -98,6 +102,9 @@ class CityLensState(TypedDict):
     latency_ms:       int
     reflection_score: int
     final_answer:     str
+    confidence_score: float
+    sub_questions:    list
+    use_multistep:    bool
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +306,47 @@ def router_node(state: CityLensState) -> CityLensState:
 # ---------------------------------------------------------------------------
 # route_to_agents: decides which agents to Send() based on branch
 # ---------------------------------------------------------------------------
+
+COMPLEX_PATTERNS = [
+    'where should i live', 'is it a good place', 'should i buy',
+    'best neighborhood for', 'worth living', 'good investment',
+    'recommend', 'suggest', 'advise',
+]
+
+def decompose_node(state: CityLensState) -> CityLensState:
+    query = state["user_query"]
+    query_lower = query.lower()
+    
+    is_complex = any(p in query_lower for p in COMPLEX_PATTERNS) or \
+                 (len(query.split()) > 10 and state["branch"] == "cross")
+    
+    if not is_complex:
+        return {**state, "sub_questions": [], "use_multistep": False}
+
+    decompose_prompt = f"""Break this question into 2-3 specific sub-questions.
+
+Original: {query}
+
+Respond in EXACT format:
+SUB1: [question about housing prices or neighborhoods]
+SUB2: [question about crime or safety]
+SUB3: [question about transit or commute]"""
+
+    result = session.sql(f"""
+        SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-haiku-4-5', $${decompose_prompt}$$) AS D
+    """).collect()
+
+    sub_questions = []
+    for line in result[0]['D'].strip().split('\n'):
+        if line.startswith('SUB') and ':' in line:
+            sub_questions.append(line.split(':', 1)[1].strip())
+
+    if sub_questions:
+        print(f"  🔍 Multi-step: decomposed into {len(sub_questions)} sub-questions")
+        for i, sq in enumerate(sub_questions):
+            print(f"     {i+1}. {sq}")
+
+    return {**state, "sub_questions": sub_questions, "use_multistep": len(sub_questions) > 0}
 
 def route_to_agents(state: CityLensState):
     """
@@ -749,10 +797,18 @@ def synthesis_node(state: CityLensState) -> dict:
     context_text = context_text[:8000]
 
     role = BRANCH_PROMPTS.get(state["branch"], "You are a Boston city intelligence analyst.")
+    
+    multistep_context = ""
+    if state.get("use_multistep") and state.get("sub_questions"):
+        multistep_context = "\n\nThis complex question was broken into sub-questions:\n"
+        for i, sq in enumerate(state["sub_questions"]):
+            multistep_context += f"{i+1}. {sq}\n"
+        multistep_context += "Please synthesize all data to answer comprehensively.\n"
 
     prompt = f"""{role}
 
 Question: {state['user_query']}
+{multistep_context}
 
 Data (use ONLY the data provided below):
 {context_text}
@@ -784,17 +840,38 @@ def reflection_node(state: CityLensState) -> dict:
 
     if any(char.isdigit() for char in answer):
         score += 30
-
     keywords = ['boston', 'district', 'neighborhood', 'line', 'route',
                 'mbta', 'crime', 'property', 'housing']
     if any(k in answer.lower() for k in keywords):
         score += 40
-
     if 100 < len(answer) < 1500:
         score += 30
 
+    # Confidence Score
+    raw_context = state.get("raw_context", {})
+    total_items = sum(len(v) for v in raw_context.values())
+    
+    # 基于 retrieval 量和 branch 确定性
+    if total_items >= 50:
+        data_confidence = 1.0
+    elif total_items >= 20:
+        data_confidence = 0.8
+    elif total_items >= 10:
+        data_confidence = 0.6
+    else:
+        data_confidence = 0.4
+
+    branch = state.get("branch", "")
+    scores_sum = state.get("total_retrievals", 0)
+    branch_confidence = 0.9 if branch != "cross" else 0.75
+
+    confidence = round((data_confidence + branch_confidence) / 2, 2)
+
     print(f"  ⭐ Reflection score: {score}/100")
-    return {"reflection_score": score, "final_answer": answer}
+    print(f"  🎯 Confidence: {confidence}")
+
+    return {"reflection_score": score, "final_answer": answer, 
+            "confidence_score": confidence}
 
 
 # ---------------------------------------------------------------------------
@@ -812,16 +889,18 @@ def build_graph():
     graph.add_node("aggregator",      aggregator_node)
     graph.add_node("synthesis",       synthesis_node)
     graph.add_node("reflection",      reflection_node)
+    graph.add_node("decompose", decompose_node)
 
     # Entry point
     graph.set_entry_point("router")
+    graph.add_edge("router", "decompose")
 
     # Router → agents (conditional parallel dispatch via Send)
     graph.add_conditional_edges(
-        "router",
-        route_to_agents,
-        ["housing_agent", "transport_agent", "crime_agent"]
-    )
+    "decompose",                              # 改这行（原来是 "router"）
+    route_to_agents,
+    ["housing_agent", "transport_agent", "crime_agent"]
+)
 
     # All agents → aggregator
     graph.add_edge("housing_agent",   "aggregator")
@@ -849,6 +928,18 @@ def run_citylens(user_query: str) -> str:
     print(f"❓ {user_query}")
     print('='*60)
 
+    # Check cache
+    cache_key = user_query.lower().strip()
+    if cache_key in _query_cache:
+        print("  ⚡ Cache hit! Returning cached answer.")
+        cached = _query_cache[cache_key]
+        print(f"\n{'='*60}")
+        print("🤖 FINAL ANSWER (cached):")
+        print(cached["answer"])
+        print(f"\n⏱  Latency    : 0ms (cached)")
+        print(f"🎯 Confidence : {cached['confidence']}")
+        return cached["answer"]
+
     initial_state: CityLensState = {
         "user_query":       user_query,
         "query_id":         str(uuid.uuid4()),
@@ -862,10 +953,23 @@ def run_citylens(user_query: str) -> str:
         "answer":           "",
         "latency_ms":       0,
         "reflection_score": 0,
+        "confidence_score": 0.0,
         "final_answer":     "",
+        "sub_questions":    [],
+        "use_multistep":    False,
     }
 
     result = citylens_graph.invoke(initial_state)
+
+    # Save to cache
+    if len(_query_cache) >= CACHE_MAX_SIZE:
+        oldest_key = next(iter(_query_cache))
+        del _query_cache[oldest_key]
+    
+    _query_cache[cache_key] = {
+        "answer":     result["final_answer"],
+        "confidence": result["confidence_score"]
+    }
 
     print(f"\n{'='*60}")
     print("🤖 FINAL ANSWER:")
@@ -873,6 +977,7 @@ def run_citylens(user_query: str) -> str:
     print(f"\n⏱  Latency    : {result['latency_ms']}ms")
     print(f"📊 Retrievals : {result['total_retrievals']}")
     print(f"⭐ Score      : {result['reflection_score']}/100")
+    print(f"🎯 Confidence : {result['confidence_score']}")
     print(f"🌿 Branch     : {result['branch']}")
 
     return result["final_answer"]
@@ -883,4 +988,5 @@ def run_citylens(user_query: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run_citylens("How do condos compare to single family homes in Boston?")
+    run_citylens("Where should I live in Boston?")
+    run_citylens("Is Beacon Hill a good place to buy a home?")
