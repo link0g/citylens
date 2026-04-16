@@ -42,6 +42,7 @@ DB = "CITYLENS_MERGED_DB"
 
 # Simple in-memory cache
 _query_cache = {}
+_conversation_history = []
 CACHE_MAX_SIZE = 100
 # ---------------------------------------------------------------------------
 # Table Config
