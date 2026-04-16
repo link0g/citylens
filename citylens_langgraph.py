@@ -42,6 +42,7 @@ DB = "CITYLENS_MERGED_DB"
 
 # Simple in-memory cache
 _query_cache = {}
+_conversation_history = []
 CACHE_MAX_SIZE = 100
 # ---------------------------------------------------------------------------
 # Table Config
@@ -105,6 +106,7 @@ class CityLensState(TypedDict):
     confidence_score: float
     sub_questions:    list
     use_multistep:    bool
+    conversation_history: list
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +220,14 @@ def router_node(state: CityLensState) -> CityLensState:
     Step 4: Update state (branch/intent/entities).
            The actual Send() dispatch happens in route_to_agents().
     """
-    query = state["user_query"].lower()
+    # 如果有对话历史，把上下文融入 query 用于 branch 检测
+    if state.get("conversation_history"):
+        recent = state["conversation_history"][-2:]
+        history_text = " ".join([h["content"] for h in recent])
+        query = (state["user_query"] + " " + history_text).lower()
+    else:
+        query = state["user_query"].lower()
+
 
     # --- Branch detection via keyword scoring ---
     housing_score   = sum(1 for k in HOUSING_KEYWORDS   if k in query)
@@ -787,14 +796,25 @@ BRANCH_PROMPTS = {
     "crime":          "You are a Boston Crime Intelligence Analyst specializing in public safety data.",
     "cross":          "You are a Boston Urban Intelligence Analyst with expertise in housing, transportation, and crime data.",
 }
+def compress_item(item: dict) -> dict:
+    exclude_keys = {'summary', 'similarity', 'housing_summary'}
+    return {k: v for k, v in item.items() if k not in exclude_keys}
 
 def synthesis_node(state: CityLensState) -> dict:
     context_text = ""
     for analyst_name, items in state["raw_context"].items():
         context_text += f"\n=== {analyst_name.upper()} ===\n"
         for item in items:
-            context_text += json.dumps(item, default=safe_serialize) + "\n"
-    context_text = context_text[:8000]
+            context_text += json.dumps(compress_item(item), default=safe_serialize) + "\n"
+    context_text = context_text[:12000]
+    
+    history_context = ""
+    if state.get("conversation_history") and len(state["conversation_history"]) > 0:
+        history_context = "\n\nPrevious conversation:\n"
+        for h in state["conversation_history"][-4:]:
+            role_label = "User" if h["role"] == "user" else "Assistant"
+            history_context += f"{role_label}: {h['content'][:150]}\n"
+        history_context += "\n"
 
     role = BRANCH_PROMPTS.get(state["branch"], "You are a Boston city intelligence analyst.")
     
@@ -809,6 +829,7 @@ def synthesis_node(state: CityLensState) -> dict:
 
 Question: {state['user_query']}
 {multistep_context}
+{history_context}
 
 Data (use ONLY the data provided below):
 {context_text}
@@ -923,16 +944,24 @@ print("✅ LangGraph parallel multi-agent compiled successfully!")
 # Main Entry Point
 # ---------------------------------------------------------------------------
 
+
+
 def run_citylens(user_query: str) -> str:
+    global _conversation_history
+
     print(f"\n{'='*60}")
     print(f"❓ {user_query}")
     print('='*60)
 
-    # Check cache
-    cache_key = user_query.lower().strip()
+    # Cache key 包含历史轮次
+    history_key = str(len(_conversation_history))
+    cache_key = f"{history_key}:{user_query.lower().strip()}"
+
     if cache_key in _query_cache:
         print("  ⚡ Cache hit! Returning cached answer.")
         cached = _query_cache[cache_key]
+        _conversation_history.append({"role": "user", "content": user_query})
+        _conversation_history.append({"role": "assistant", "content": cached["answer"]})
         print(f"\n{'='*60}")
         print("🤖 FINAL ANSWER (cached):")
         print(cached["answer"])
@@ -941,31 +970,40 @@ def run_citylens(user_query: str) -> str:
         return cached["answer"]
 
     initial_state: CityLensState = {
-        "user_query":       user_query,
-        "query_id":         str(uuid.uuid4()),
-        "query_ts":         datetime.now().isoformat(),
-        "branch":           "",
-        "intent":           "",
-        "entities":         {},
-        "agent_results":    [],
-        "raw_context":      {},
-        "total_retrievals": 0,
-        "answer":           "",
-        "latency_ms":       0,
-        "reflection_score": 0,
-        "confidence_score": 0.0,
-        "final_answer":     "",
-        "sub_questions":    [],
-        "use_multistep":    False,
+        "user_query":           user_query,
+        "query_id":             str(uuid.uuid4()),
+        "query_ts":             datetime.now().isoformat(),
+        "branch":               "",
+        "intent":               "",
+        "entities":             {},
+        "agent_results":        [],
+        "raw_context":          {},
+        "total_retrievals":     0,
+        "answer":               "",
+        "latency_ms":           0,
+        "reflection_score":     0,
+        "confidence_score":     0.0,
+        "final_answer":         "",
+        "sub_questions":        [],
+        "use_multistep":        False,
+        "conversation_history": _conversation_history[-4:],
     }
 
     result = citylens_graph.invoke(initial_state)
 
-    # Save to cache
+    # 更新对话历史
+    _conversation_history.append({"role": "user", "content": user_query})
+    _conversation_history.append({"role": "assistant", "content": result["final_answer"][:300]})
+
+    # 保持最多 10 轮
+    if len(_conversation_history) > 20:
+        _conversation_history = _conversation_history[-20:]
+
+    # 保存到 cache
     if len(_query_cache) >= CACHE_MAX_SIZE:
         oldest_key = next(iter(_query_cache))
         del _query_cache[oldest_key]
-    
+
     _query_cache[cache_key] = {
         "answer":     result["final_answer"],
         "confidence": result["confidence_score"]
@@ -983,10 +1021,12 @@ def run_citylens(user_query: str) -> str:
     return result["final_answer"]
 
 
+
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run_citylens("Where should I live in Boston?")
-    run_citylens("Is Beacon Hill a good place to buy a home?")
+    run_citylens("What are the most expensive neighborhoods in Boston?")
+    run_citylens("What about crime rates in those neighborhoods?")
+    run_citylens("And how is the transit access there?")
