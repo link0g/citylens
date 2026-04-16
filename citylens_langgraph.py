@@ -103,6 +103,8 @@ class CityLensState(TypedDict):
     reflection_score: int
     final_answer:     str
     confidence_score: float
+    sub_questions:    list
+    use_multistep:    bool
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +306,47 @@ def router_node(state: CityLensState) -> CityLensState:
 # ---------------------------------------------------------------------------
 # route_to_agents: decides which agents to Send() based on branch
 # ---------------------------------------------------------------------------
+
+COMPLEX_PATTERNS = [
+    'where should i live', 'is it a good place', 'should i buy',
+    'best neighborhood for', 'worth living', 'good investment',
+    'recommend', 'suggest', 'advise',
+]
+
+def decompose_node(state: CityLensState) -> CityLensState:
+    query = state["user_query"]
+    query_lower = query.lower()
+    
+    is_complex = any(p in query_lower for p in COMPLEX_PATTERNS) or \
+                 (len(query.split()) > 10 and state["branch"] == "cross")
+    
+    if not is_complex:
+        return {**state, "sub_questions": [], "use_multistep": False}
+
+    decompose_prompt = f"""Break this question into 2-3 specific sub-questions.
+
+Original: {query}
+
+Respond in EXACT format:
+SUB1: [question about housing prices or neighborhoods]
+SUB2: [question about crime or safety]
+SUB3: [question about transit or commute]"""
+
+    result = session.sql(f"""
+        SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-haiku-4-5', $${decompose_prompt}$$) AS D
+    """).collect()
+
+    sub_questions = []
+    for line in result[0]['D'].strip().split('\n'):
+        if line.startswith('SUB') and ':' in line:
+            sub_questions.append(line.split(':', 1)[1].strip())
+
+    if sub_questions:
+        print(f"  🔍 Multi-step: decomposed into {len(sub_questions)} sub-questions")
+        for i, sq in enumerate(sub_questions):
+            print(f"     {i+1}. {sq}")
+
+    return {**state, "sub_questions": sub_questions, "use_multistep": len(sub_questions) > 0}
 
 def route_to_agents(state: CityLensState):
     """
@@ -754,10 +797,18 @@ def synthesis_node(state: CityLensState) -> dict:
     context_text = context_text[:8000]
 
     role = BRANCH_PROMPTS.get(state["branch"], "You are a Boston city intelligence analyst.")
+    
+    multistep_context = ""
+    if state.get("use_multistep") and state.get("sub_questions"):
+        multistep_context = "\n\nThis complex question was broken into sub-questions:\n"
+        for i, sq in enumerate(state["sub_questions"]):
+            multistep_context += f"{i+1}. {sq}\n"
+        multistep_context += "Please synthesize all data to answer comprehensively.\n"
 
     prompt = f"""{role}
 
 Question: {state['user_query']}
+{multistep_context}
 
 Data (use ONLY the data provided below):
 {context_text}
@@ -838,16 +889,18 @@ def build_graph():
     graph.add_node("aggregator",      aggregator_node)
     graph.add_node("synthesis",       synthesis_node)
     graph.add_node("reflection",      reflection_node)
+    graph.add_node("decompose", decompose_node)
 
     # Entry point
     graph.set_entry_point("router")
+    graph.add_edge("router", "decompose")
 
     # Router → agents (conditional parallel dispatch via Send)
     graph.add_conditional_edges(
-        "router",
-        route_to_agents,
-        ["housing_agent", "transport_agent", "crime_agent"]
-    )
+    "decompose",                              # 改这行（原来是 "router"）
+    route_to_agents,
+    ["housing_agent", "transport_agent", "crime_agent"]
+)
 
     # All agents → aggregator
     graph.add_edge("housing_agent",   "aggregator")
@@ -902,6 +955,8 @@ def run_citylens(user_query: str) -> str:
         "reflection_score": 0,
         "confidence_score": 0.0,
         "final_answer":     "",
+        "sub_questions":    [],
+        "use_multistep":    False,
     }
 
     result = citylens_graph.invoke(initial_state)
@@ -933,7 +988,5 @@ def run_citylens(user_query: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # 第一次跑（正常速度）
-    run_citylens("What are the most expensive neighborhoods in Boston?")
-    # 第二次跑同样问题（应该瞬间返回）
-    run_citylens("What are the most expensive neighborhoods in Boston?")
+    run_citylens("Where should I live in Boston?")
+    run_citylens("Is Beacon Hill a good place to buy a home?")
