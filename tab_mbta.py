@@ -123,8 +123,24 @@ def render_mbta_tab(session, DB):
 
     # ── Route Performance ─────────────────────────────────────────────────────
     with mtab1:
-        st.markdown("#### 📈 Weekly Events by Route")
+
+        rel_df    = load_reliability()
         weekly_df = load_weekly_events()
+        dow_df    = load_dow()
+
+        # ── KPIs ─────────────────────────────────────────────────────────────
+        if not rel_df.empty:
+            best  = rel_df.iloc[0]
+            worst = rel_df.iloc[-1]
+            avg_rel = round(rel_df["RELIABILITY_PCT"].mean(), 1)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Most Reliable", best["ROUTE_ID"], f"{best['RELIABILITY_PCT']}%")
+            c2.metric("Avg Reliability", f"{avg_rel}%")
+            c3.metric("Least Reliable", worst["ROUTE_ID"], f"{worst['RELIABILITY_PCT']}%")
+            st.divider()
+
+        # ── Weekly Events ─────────────────────────────────────────────────────
+        st.markdown("#### 📈 Weekly Events by Route")
         if not weekly_df.empty:
             routes = weekly_df["ROUTE_ID"].unique().tolist()
             selected_routes = st.multiselect("Select routes:", routes, default=routes[:3])
@@ -139,27 +155,87 @@ def render_mbta_tab(session, DB):
             st.info("Weekly events data unavailable.")
 
         st.divider()
+
+        # ── Day of Week sorted Mon-Sun ────────────────────────────────────────
         st.markdown("#### 📅 Events by Day of Week")
-        dow_df = load_dow()
         if not dow_df.empty:
+            day_order = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            dow_df["DAY_OF_WEEK"] = pd.Categorical(
+                dow_df["DAY_OF_WEEK"], categories=day_order, ordered=True
+            )
+            dow_df = dow_df.sort_values("DAY_OF_WEEK")
             st.bar_chart(dow_df.set_index("DAY_OF_WEEK")["AVG_EVENTS"])
         else:
             st.info("Day of week data unavailable.")
 
         st.divider()
+
+        # ── Route Reliability (table only, cleaned labels) ────────────────────
         st.markdown("#### 🏆 Route Reliability")
-        rel_df = load_reliability()
         if not rel_df.empty:
-            st.dataframe(rel_df, use_container_width=True)
-            st.bar_chart(rel_df.set_index("ROUTE_ID")["RELIABILITY_PCT"])
+            rel_display = rel_df.copy()
+            rel_display["RELIABILITY_GRADE"] = (
+                rel_display["RELIABILITY_GRADE"]
+                .str.replace("_", " ")
+                .str.title()
+            )
+            rel_display = rel_display.rename(columns={
+                "ROUTE_ID":         "Route",
+                "RELIABILITY_PCT":  "Reliability %",
+                "RELIABILITY_GRADE":"Grade",
+                "BAD_DAYS":         "Bad Days",
+                "TOTAL_DAYS":       "Total Days",
+            })
+            st.dataframe(
+                rel_display[["Route", "Reliability %", "Grade", "Bad Days", "Total Days"]],
+                use_container_width=True,
+                hide_index=True,
+            )
         else:
             st.info("Reliability data unavailable.")
 
     # ── Weather Impact ────────────────────────────────────────────────────────
     with mtab2:
-        st.markdown("#### 🌤️ Weather Condition vs MBTA Performance")
+        st.markdown("#### 🌤️ Weather Impact on MBTA Performance")
+
         weather_df = load_weather()
+        temp_df    = load_temp()
+
         if not weather_df.empty:
+            # Clean up labels
+            weather_df = weather_df.copy()
+            weather_df["WEATHER_CONDITION"] = (
+                weather_df["WEATHER_CONDITION"].str.replace("_", " ").str.title()
+            )
+
+            # Find normal baseline for comparison
+            normal_row = weather_df[weather_df["WEATHER_CONDITION"] == "Normal"]
+            normal_events = int(normal_row["AVG_EVENTS"].values[0]) if not normal_row.empty else None
+            normal_trips  = int(normal_row["AVG_TRIPS"].values[0])  if not normal_row.empty else None
+
+            # KPI insight cards
+            if normal_events:
+                cols = st.columns(len(weather_df))
+                for col, (_, row) in zip(cols, weather_df.iterrows()):
+                    cond   = row["WEATHER_CONDITION"]
+                    events = int(row["AVG_EVENTS"])
+                    trips  = int(row["AVG_TRIPS"])
+                    diff_pct = round((events - normal_events) / normal_events * 100, 1) if cond != "Normal" else 0
+                    diff_str = f"{diff_pct:+.1f}% vs normal" if cond != "Normal" else "Baseline"
+                    color = "#9f1239" if diff_pct < -2 else ("#065f46" if diff_pct > 2 else "#6b7280")
+                    col.markdown(f"""
+                    <div style='background:#fff; border:1px solid #e8e6e0; border-radius:10px;
+                                padding:0.8rem 1rem; text-align:center;'>
+                        <div style='font-size:0.8rem; color:#6b7280; margin-bottom:4px;'>{cond}</div>
+                        <div style='font-size:1.2rem; font-weight:600; color:#1a1a1a;'>{events:,}</div>
+                        <div style='font-size:0.75rem; color:#9ca3af;'>avg events</div>
+                        <div style='font-size:0.78rem; font-weight:500; color:{color}; margin-top:4px;'>{diff_str}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            st.divider()
+
+            # Charts side by side — no table
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("**Avg Events by Weather**")
@@ -167,15 +243,32 @@ def render_mbta_tab(session, DB):
             with col2:
                 st.markdown("**Avg Trips by Weather**")
                 st.bar_chart(weather_df.set_index("WEATHER_CONDITION")["AVG_TRIPS"])
-            st.divider()
-            st.dataframe(weather_df, use_container_width=True)
+
         else:
             st.info("Weather data unavailable.")
 
         st.divider()
+
+        # Temperature section
         st.markdown("#### 🌡️ Temperature vs Events")
-        temp_df = load_temp()
         if not temp_df.empty:
+            temp_df = temp_df.copy()
+            temp_order = ["COLD", "MILD", "WARM"]
+            temp_df["TEMP_CATEGORY"] = pd.Categorical(
+                temp_df["TEMP_CATEGORY"], categories=temp_order, ordered=True
+            )
+            temp_df = temp_df.sort_values("TEMP_CATEGORY")
+            temp_df["TEMP_CATEGORY"] = temp_df["TEMP_CATEGORY"].str.title()
+
+            # Insight
+            if len(temp_df) >= 2:
+                cold_val = temp_df[temp_df["TEMP_CATEGORY"] == "Cold"]["AVG_EVENTS"].values
+                warm_val = temp_df[temp_df["TEMP_CATEGORY"] == "Warm"]["AVG_EVENTS"].values
+                if len(cold_val) > 0 and len(warm_val) > 0:
+                    diff = round((int(warm_val[0]) - int(cold_val[0])) / int(cold_val[0]) * 100, 1)
+                    direction = "more" if diff > 0 else "fewer"
+                    st.caption(f"Warm days see **{abs(diff)}% {direction}** MBTA events than cold days.")
+
             st.bar_chart(temp_df.set_index("TEMP_CATEGORY")["AVG_EVENTS"])
         else:
             st.info("Temperature data unavailable.")
@@ -254,9 +347,18 @@ def render_mbta_tab(session, DB):
             st.markdown("🔴 Red &nbsp;&nbsp; 🔵 Blue &nbsp;&nbsp; 🟠 Orange &nbsp;&nbsp; 🟢 Green &nbsp;&nbsp; ⬜ Silver")
             st.divider()
             st.markdown("#### 📊 Station Details")
-            st.dataframe(
-                station_df[["STATION_NAME","LINE_NAME","MUNICIPALITY","TOTAL_EVENTS","UNIQUE_TRIPS","DAYS_WITH_SERVICE"]].sort_values("TOTAL_EVENTS", ascending=False),
-                use_container_width=True
-            )
+            station_display = station_df.groupby(["STATION_NAME", "MUNICIPALITY"]).agg(
+                Lines=("LINE_NAME", lambda x: ", ".join(sorted(x.dropna().unique()))),
+                Total_Events=("TOTAL_EVENTS", "max"),
+                Unique_Trips=("UNIQUE_TRIPS", "max"),
+                Days_With_Service=("DAYS_WITH_SERVICE", "max"),
+            ).reset_index().sort_values("Total_Events", ascending=False)
+
+            station_display = station_display.rename(columns={
+                "STATION_NAME":   "Station",
+                "MUNICIPALITY":   "City",
+            })
+            st.dataframe(station_display, use_container_width=True, hide_index=True)
+            
         else:
             st.info("Station data unavailable.")
