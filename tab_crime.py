@@ -1,9 +1,23 @@
+import re
 import json
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
 from datetime import datetime, timedelta
 from config import DISTRICT_MAP, NBHD_TO_DISTRICT
+
+
+def extract_highlighted_districts(answer):
+    """Parse AI answer to find mentioned districts/neighborhoods."""
+    highlighted = set()
+    answer_upper = answer.upper()
+    for code in DISTRICT_MAP.keys():
+        if re.search(rf'\b{code}\b', answer_upper):
+            highlighted.add(code)
+    for nbhd_upper, code in NBHD_TO_DISTRICT.items():
+        if nbhd_upper in answer_upper:
+            highlighted.add(code)
+    return highlighted
 
 
 def render_crime_tab(session, DB):
@@ -42,6 +56,70 @@ def render_crime_tab(session, DB):
 
     df["OCCURRED_ON_DATE"] = pd.to_datetime(df["OCCURRED_ON_DATE"])
     df["year"] = df["OCCURRED_ON_DATE"].dt.year
+
+    # ── AI session state ──────────────────────────────────────────────────────
+    if "crime_ai_answer" not in st.session_state:
+        st.session_state.crime_ai_answer = ""
+    if "crime_ai_highlights" not in st.session_state:
+        st.session_state.crime_ai_highlights = set()
+
+    # ── AI Assistant ──────────────────────────────────────────────────────────
+    st.markdown("#### 🤖 Ask about crime data")
+    ai_col, btn_col = st.columns([5, 1])
+    with ai_col:
+        crime_q = st.text_input(
+            "crime_q", label_visibility="collapsed",
+            placeholder="e.g. Which district has the most crime? Which area is safest?",
+            key="crime_ai_input"
+        )
+    with btn_col:
+        crime_ask = st.button("Ask", key="crime_ai_btn", use_container_width=True)
+
+    if crime_ask and crime_q.strip():
+        with st.spinner("Analyzing…"):
+            # Build context from data
+            agg_all = df["DISTRICT"].value_counts().reset_index()
+            agg_all.columns = ["DISTRICT", "crime_count"]
+            agg_all["district_name"] = agg_all["DISTRICT"].map(DISTRICT_MAP).fillna(agg_all["DISTRICT"])
+            ctx = agg_all.to_csv(index=False)
+
+            prompt = f"""You are a Boston Crime Intelligence Analyst.
+Answer using only the data below. Be specific with district names and numbers.
+Always mention the full neighborhood name (e.g. "Roxbury (B2)").
+
+Crime data by district:
+{ctx}
+
+Question: {crime_q}"""
+
+            try:
+                result = session.sql(f"""
+                    SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-haiku-4-5', $${prompt}$$) AS ANSWER
+                """).collect()
+                answer = result[0]["ANSWER"]
+                st.session_state.crime_ai_answer = answer
+                st.session_state.crime_ai_highlights = extract_highlighted_districts(answer)
+            except Exception as e:
+                st.session_state.crime_ai_answer = f"Error: {e}"
+                st.session_state.crime_ai_highlights = set()
+
+    if st.session_state.crime_ai_answer:
+        st.markdown(f"""
+        <div style='background:#ffffff; border:1px solid #e8e6e0; border-radius:12px;
+                    padding:1rem 1.2rem; margin-bottom:1rem; font-size:0.92rem;
+                    line-height:1.7; color:#2d2d2d;'>
+            {st.session_state.crime_ai_answer.replace(chr(10), "<br>")}
+        </div>
+        """, unsafe_allow_html=True)
+        if st.session_state.crime_ai_highlights:
+            names = [f"{DISTRICT_MAP.get(c, c)} ({c})" for c in st.session_state.crime_ai_highlights]
+            st.info(f"🗺️ Highlighted on map: {', '.join(names)}")
+        if st.button("Clear", key="crime_ai_clear"):
+            st.session_state.crime_ai_answer = ""
+            st.session_state.crime_ai_highlights = set()
+            st.rerun()
+
+    st.divider()
 
     # ── Filters ──────────────────────────────────────────────────────────────
     col_f1, col_f2 = st.columns(2)
@@ -110,8 +188,8 @@ def render_crime_tab(session, DB):
 
         try:
             geo_rows = load_neighborhood_geojson()
-            crime_counts = df_filtered["DISTRICT"].value_counts().to_dict()
-            max_count = max(crime_counts.values()) if crime_counts else 1
+            crime_counts_all = df["DISTRICT"].value_counts().to_dict()
+            max_count = max(crime_counts_all.values()) if crime_counts_all else 1
 
             features = []
             for row in geo_rows:
@@ -122,13 +200,28 @@ def render_crime_tab(session, DB):
                     continue
 
                 district_code = NBHD_TO_DISTRICT.get(nbhd.upper())
-                count = crime_counts.get(district_code, 0)
+                if district_code is None:
+                    continue
+                count = crime_counts_all.get(district_code, 0)
                 ratio = count / max_count if max_count > 0 else 0
                 r_val = int(50  + ratio * 200)
                 g_val = int(180 - ratio * 150)
-                alpha = 180
-                if risk_filter != "All" and district_code:
+
+                ai_highlights = st.session_state.get("crime_ai_highlights", set())
+
+                if ai_highlights:
+                    # AI highlight mode: highlight mentioned districts
+                    if district_code in ai_highlights:
+                        alpha = 220
+                        r_val = min(255, r_val + 30)
+                    else:
+                        alpha = 40
+                elif selected_district != "All":
+                    alpha = 200 if district_code == selected_district else 0
+                elif risk_filter != "All" and district_code:
                     alpha = 180 if risk_level(district_code) == risk_filter else 30
+                else:
+                    alpha = 180
 
                 features.append({
                     "type": "Feature",
@@ -186,16 +279,16 @@ def render_crime_tab(session, DB):
     st.divider()
 
     # ── Trend Chart ───────────────────────────────────────────────────────────
-    st.markdown("#### 📊 Crime Trend")
-    if selected_district == "All":
-        st.bar_chart(agg.set_index("district_name")["crime_count"])
-    else:
-        df_recent = df_filtered[
-            df_filtered["OCCURRED_ON_DATE"] >= datetime.now() - timedelta(days=90)
-        ].copy()
-        df_recent["week"] = df_recent["OCCURRED_ON_DATE"].dt.to_period("W").astype(str)
-        trend = df_recent.groupby("week").size()
-        if not trend.empty:
-            st.bar_chart(trend)
-        else:
-            st.info("No recent data available for this selection.")
+    # st.markdown("#### 📊 Crime Trend")
+    # if selected_district == "All":
+    #     st.bar_chart(agg.set_index("district_name")["crime_count"])
+    # else:
+    #     df_recent = df_filtered[
+    #         df_filtered["OCCURRED_ON_DATE"] >= datetime.now() - timedelta(days=90)
+    #     ].copy()
+    #     df_recent["week"] = df_recent["OCCURRED_ON_DATE"].dt.to_period("W").astype(str)
+    #     trend = df_recent.groupby("week").size()
+    #     if not trend.empty:
+    #         st.bar_chart(trend)
+    #     else:
+    #         st.info("No recent data available for this selection.")

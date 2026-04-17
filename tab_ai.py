@@ -57,6 +57,7 @@ def render_ai_tab(session, DB):
                     "query": query, "branch": branch,
                     "latency": latency, "score": score,
                     "ts": datetime.now().strftime("%H:%M"),
+                    "answer": answer,
                 })
 
                 tag_map = {
@@ -112,7 +113,7 @@ def render_ai_tab(session, DB):
     if not st.session_state.history and not (ask and query.strip()):
         st.markdown("""
         <div class='empty-state'>
-            <div class='empty-icon'>🏙️</div>
+            <div class='empty-icon'>◎</div>
             <div class='empty-text'>Ask anything about Boston</div>
             <div class='empty-sub'>Housing · Crime · Transit · Neighborhoods</div>
         </div>

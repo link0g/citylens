@@ -87,19 +87,19 @@ div[data-testid="column"]:last-child .stButton > button:hover {
 }
 .stTextInput label { display: none !important; }
 
-.hero-wrap { padding: 2.5rem 0 1.5rem; }
+.hero-wrap { padding: 1.2rem 0 0.8rem; }
 .hero-title {
     font-family: 'Instrument Serif', serif;
-    font-size: 3.2rem;
+    font-size: 2.6rem;
     color: #1a1a1a;
     line-height: 1.1;
-    margin-bottom: 0.4rem;
+    margin-bottom: 0.25rem;
     font-weight: 400;
 }
 .hero-title em { font-style: italic; color: #6b7280; }
 .hero-sub {
-    font-size: 0.8rem;
-    color: #9ca3af;
+    font-size: 0.75rem;
+    color: #b0a89c;
     letter-spacing: 0.12em;
     text-transform: uppercase;
 }
@@ -159,10 +159,10 @@ div[data-testid="column"]:last-child .stButton > button:hover {
 .div-line { border-top: 1px solid #f0ede8; margin: 1.2rem 0; }
 .sidebar-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; color: #b0a89c; font-weight: 600; margin-bottom: 8px; margin-top: 4px; }
 
-.empty-state { text-align: center; padding: 4rem 0; }
-.empty-icon { font-size: 2.5rem; margin-bottom: 1rem; }
-.empty-text { font-family: 'Instrument Serif', serif; font-size: 1.4rem; color: #c8c4bc; font-weight: 400; }
-.empty-sub { font-size: 0.8rem; color: #d1cdc7; margin-top: 0.4rem; }
+.empty-state { text-align: center; padding: 3rem 0; }
+.empty-icon { font-size: 2rem; margin-bottom: 0.8rem; opacity: 0.4; }
+.empty-text { font-family: 'Instrument Serif', serif; font-size: 1.3rem; color: #9ca3af; font-weight: 400; }
+.empty-sub { font-size: 0.78rem; color: #b0a89c; margin-top: 0.3rem; letter-spacing: 0.05em; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -181,6 +181,32 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
+    # ── History (shown first) ─────────────────────────────────────────────────
+    if st.session_state.history:
+        st.markdown("<div class='sidebar-label'>History</div>", unsafe_allow_html=True)
+
+        for i, item in enumerate(reversed(st.session_state.history)):
+            dot_color = {
+                "housing": "#065f46", "transportation": "#1e40af",
+                "crime": "#9f1239", "cross": "#6b21a8"
+            }.get(item.get("branch", ""), "#9ca3af")
+
+            with st.expander(f"{item['query'][:42]}{'…' if len(item['query']) > 42 else ''}", expanded=False):
+                st.markdown(
+                    f"<div style='font-size:0.75rem; color:#b0a89c; margin-bottom:6px;'>"
+                    f"<span style='color:{dot_color}'>●</span> "
+                    f"{item.get('branch','—')} · {item.get('ts','')}</div>",
+                    unsafe_allow_html=True
+                )
+                answer_text = item.get("answer", "—").replace("$", "\\$")
+                st.markdown(answer_text)
+                if st.button("Ask again", key=f"reask_{i}"):
+                    st.session_state.prefill = item["query"]
+                    st.rerun()
+
+        st.markdown("<div class='div-line'></div>", unsafe_allow_html=True)
+
+    # ── Try asking ────────────────────────────────────────────────────────────
     st.markdown("<div class='sidebar-label'>Try asking</div>", unsafe_allow_html=True)
 
     samples = [
@@ -208,24 +234,6 @@ with st.sidebar:
         <div class='pipe-item'><div class='pipe-dot'></div>Reflection — quality score</div>
     </div>
     """, unsafe_allow_html=True)
-
-    if st.session_state.history:
-        st.markdown("<div class='div-line'></div>", unsafe_allow_html=True)
-        st.markdown("<div class='sidebar-label'>Recent</div>", unsafe_allow_html=True)
-        for item in reversed(st.session_state.history[-4:]):
-            dot_color = {
-                "housing": "#065f46", "transportation": "#1e40af",
-                "crime": "#9f1239", "cross": "#6b21a8"
-            }.get(item.get("branch", ""), "#9ca3af")
-            st.markdown(f"""
-            <div class='hist-item'>
-                <div class='hist-q'>{item['query'][:52]}{'…' if len(item['query']) > 52 else ''}</div>
-                <div class='hist-meta'>
-                    <span style='color:{dot_color}'>●</span>
-                    {item.get('branch', '—')} · {item.get('latency', 0)}ms · {item.get('ts', '')}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
 
 # ── Hero ──────────────────────────────────────────────────────────────────────
 st.markdown("""
