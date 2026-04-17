@@ -433,16 +433,44 @@ def housing_qa_analyst(query_text):
              'similarity': float(r['SIMILARITY'])}
             for r in results if r['SUMMARY_TEXT']]
 
-def housing_price_analyst():
+def housing_price_analyst(query_text=""):
+    query_lower = query_text.lower()
+    
+    # 如果问题涉及商业/投资，包含所有地产类型
+    if any(w in query_lower for w in ['commercial', 'investment', 'office', 
+                                       'retail', 'business', 'all property', 'all types']):
+        category_filter = ""
+        note = "all property types"
+    else:
+        category_filter = "AND pt.CATEGORY = 'residential'"
+        note = "residential only"
+    
     results = session.sql(f"""
-        SELECT EXCEPTION_TYPE, NEIGHBORHOOD_NAME, AVG_PROPERTY_VALUE,
-               MEDIAN_PROPERTY_VALUE, AVG_PRICE_PER_SQFT, RANK
-        FROM {Tables.HOUSING_MART_EXCEPTIONS}
-        WHERE EXCEPTION_TYPE IN ('TOP_5_MOST_EXPENSIVE','BOTTOM_5_LEAST_EXPENSIVE')
-        ORDER BY EXCEPTION_TYPE, RANK
+        SELECT 
+            n.NEIGHBORHOOD_NAME,
+            COUNT(f.PROPERTY_ID) AS TOTAL_PROPERTIES,
+            ROUND(AVG(f.TOTAL_VALUE), 2) AS AVG_PROPERTY_VALUE,
+            ROUND(MEDIAN(f.TOTAL_VALUE), 2) AS MEDIAN_PROPERTY_VALUE,
+            ROUND(AVG(f.PRICE_PER_SQFT), 2) AS AVG_PRICE_PER_SQFT
+        FROM {Tables.HOUSING_FACT_PROPERTY} f
+        JOIN {Tables.HOUSING_DIM_PROPERTY_TYPE} pt 
+            ON f.PROPERTY_TYPE_KEY = pt.PROPERTY_TYPE_KEY
+        JOIN {DB}.HOUSING_CORE.DIM_NEIGHBORHOOD n
+            ON f.NEIGHBORHOOD_KEY = n.NEIGHBORHOOD_KEY
+        WHERE f.TOTAL_VALUE > 0
+          AND f.PRICE_PER_SQFT > 0
+          {category_filter}
+        GROUP BY n.NEIGHBORHOOD_NAME
+        ORDER BY AVG_PROPERTY_VALUE DESC
+        LIMIT 10
     """).to_pandas()
-    return [{'type': r['EXCEPTION_TYPE'], 'neighborhood': r['NEIGHBORHOOD_NAME'],
-             'avg_value': r['AVG_PROPERTY_VALUE'], 'rank': r['RANK']}
+    
+    return [{'neighborhood': r['NEIGHBORHOOD_NAME'],
+             'avg_value': float(r['AVG_PROPERTY_VALUE']),
+             'median_value': float(r['MEDIAN_PROPERTY_VALUE']),
+             'avg_price_per_sqft': float(r['AVG_PRICE_PER_SQFT']),
+             'total_properties': int(r['TOTAL_PROPERTIES']),
+             'data_scope': note}
             for _, r in results.iterrows()]
 
 def housing_building_type_analyst():
@@ -676,6 +704,7 @@ def housing_agent_node(state: CityLensState) -> dict:
     data["neighborhood"] = housing_neighborhood_analyst(query_text)
     data["qa_context"]   = housing_qa_analyst(query_text)
     data["price"]        = housing_price_analyst()
+    data["price"] = housing_price_analyst(query_text)
 
     query_lower = state["user_query"].lower()
     if intent == "building_type" or any(w in query_lower for w in ['condo', 'single family', 'two family']):
@@ -790,7 +819,7 @@ def aggregator_node(state: CityLensState) -> dict:
 # ---------------------------------------------------------------------------
 
 BRANCH_PROMPTS = {
-    "housing":        "You are a Boston Housing Intelligence Analyst.",
+    "housing":        "You are a Boston Housing Intelligence Analyst.Note: property values in this dataset reflect residential properties only from Boston's official assessment records.",
     "transportation": "You are a senior Boston MBTA Transportation Analyst.",
     "crime":          "You are a Boston Crime Intelligence Analyst specializing in public safety data.",
     "cross":          "You are a Boston Urban Intelligence Analyst with expertise in housing, transportation, and crime data.",
@@ -1012,5 +1041,6 @@ def run_citylens(user_query: str) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run_citylens("Where should I live in Boston?")
-    run_citylens("Is Beacon Hill a good place to buy a home?")
+    run_citylens("What are the most expensive neighborhoods in Boston?")
+    run_citylens("What are the best commercial investment areas in Boston?")
+    
