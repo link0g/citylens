@@ -9,6 +9,8 @@ def render_ai_tab(session, DB):
     # ── Session state ─────────────────────────────────────────────────────────
     if "conversation" not in st.session_state:
         st.session_state.conversation = []
+    if "input_counter" not in st.session_state:
+        st.session_state.input_counter = 0
 
     tag_map = {
         "housing":        ("🏠 Housing",        "tag-housing"),
@@ -24,7 +26,7 @@ def render_ai_tab(session, DB):
             "q",
             label_visibility="collapsed",
             placeholder="Ask about Boston housing, crime, or transit…",
-            key="query_box",
+            key=f"query_box_{st.session_state.input_counter}",
         )
     with col_btn:
         ask = st.button("Ask →", use_container_width=True)
@@ -104,7 +106,7 @@ def render_ai_tab(session, DB):
                     "ts": datetime.now().strftime("%H:%M"),
                     "answer": answer,
                 })
-
+                st.session_state.input_counter += 1
                 st.rerun()
 
             except ImportError:
@@ -182,3 +184,12 @@ def render_ai_tab(session, DB):
                 </div>
                 <div style='margin-bottom:1rem;'></div>
                 """, unsafe_allow_html=True)
+
+        # Scroll to latest answer after rerun
+        st.markdown("<div id='latest-answer'></div>", unsafe_allow_html=True)
+        st.components.v1.html("""
+            <script>
+                const el = window.parent.document.getElementById('latest-answer');
+                if (el) el.scrollIntoView({behavior: 'smooth', block: 'end'});
+            </script>
+        """, height=0)
