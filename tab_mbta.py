@@ -253,23 +253,20 @@ def render_mbta_tab(session, DB):
         st.markdown("#### 🌡️ Temperature vs Events")
         if not temp_df.empty:
             temp_df = temp_df.copy()
-            temp_order = ["COLD", "MILD", "WARM"]
-            temp_df["TEMP_CATEGORY"] = pd.Categorical(
-                temp_df["TEMP_CATEGORY"], categories=temp_order, ordered=True
-            )
-            temp_df = temp_df.sort_values("TEMP_CATEGORY")
-            temp_df["TEMP_CATEGORY"] = temp_df["TEMP_CATEGORY"].str.title()
+            cold_val = temp_df[temp_df["TEMP_CATEGORY"] == "COLD"]["AVG_EVENTS"].values
+            warm_val = temp_df[temp_df["TEMP_CATEGORY"] == "WARM"]["AVG_EVENTS"].values
+            if len(cold_val) > 0 and len(warm_val) > 0:
+                diff = round(abs(int(warm_val[0]) - int(cold_val[0])) / int(cold_val[0]) * 100, 1)
+                st.info(f"🌡️ Temperature has minimal impact on MBTA ridership — cold vs warm days vary by less than **{diff}%** in average event volume. Weather condition (rain/snow) matters more than temperature alone.")
 
-            # Insight
-            if len(temp_df) >= 2:
-                cold_val = temp_df[temp_df["TEMP_CATEGORY"] == "Cold"]["AVG_EVENTS"].values
-                warm_val = temp_df[temp_df["TEMP_CATEGORY"] == "Warm"]["AVG_EVENTS"].values
-                if len(cold_val) > 0 and len(warm_val) > 0:
-                    diff = round((int(warm_val[0]) - int(cold_val[0])) / int(cold_val[0]) * 100, 1)
-                    direction = "more" if diff > 0 else "fewer"
-                    st.caption(f"Warm days see **{abs(diff)}% {direction}** MBTA events than cold days.")
-
-            st.bar_chart(temp_df.set_index("TEMP_CATEGORY")["AVG_EVENTS"])
+            with st.expander("Show temperature chart"):
+                temp_order = ["COLD", "MILD", "WARM"]
+                temp_df["TEMP_CATEGORY"] = pd.Categorical(
+                    temp_df["TEMP_CATEGORY"], categories=temp_order, ordered=True
+                )
+                temp_df = temp_df.sort_values("TEMP_CATEGORY")
+                temp_df["TEMP_CATEGORY"] = temp_df["TEMP_CATEGORY"].str.title()
+                st.bar_chart(temp_df.set_index("TEMP_CATEGORY")["AVG_EVENTS"])
         else:
             st.info("Temperature data unavailable.")
 

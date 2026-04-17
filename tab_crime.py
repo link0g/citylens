@@ -278,17 +278,59 @@ Question: {crime_q}"""
 
     st.divider()
 
-    # ── Trend Chart ───────────────────────────────────────────────────────────
-    # st.markdown("#### 📊 Crime Trend")
-    # if selected_district == "All":
-    #     st.bar_chart(agg.set_index("district_name")["crime_count"])
-    # else:
-    #     df_recent = df_filtered[
-    #         df_filtered["OCCURRED_ON_DATE"] >= datetime.now() - timedelta(days=90)
-    #     ].copy()
-    #     df_recent["week"] = df_recent["OCCURRED_ON_DATE"].dt.to_period("W").astype(str)
-    #     trend = df_recent.groupby("week").size()
-    #     if not trend.empty:
-    #         st.bar_chart(trend)
-    #     else:
-    #         st.info("No recent data available for this selection.")
+    # ── Crime Trend by District ───────────────────────────────────────────────
+    st.markdown("#### 📈 Crime Trend by District")
+
+    @st.cache_data(ttl=300)
+    def load_monthly_by_district():
+        return session.sql(f"""
+            SELECT
+                DISTRICT,
+                DATE_TRUNC('month', OCCURRED_ON_DATE)::DATE AS MONTH,
+                COUNT(*) AS CRIME_COUNT
+            FROM {DB}.CRIME_PUBLIC.CRIME_RAW
+            WHERE DISTRICT IS NOT NULL
+            AND OCCURRED_ON_DATE >= DATEADD(year, -3, CURRENT_DATE)
+            GROUP BY 1, 2
+            ORDER BY 2, 1
+        """).to_pandas()
+
+    trend_df = load_monthly_by_district()
+
+    if not trend_df.empty:
+        trend_df["MONTH"] = pd.to_datetime(trend_df["MONTH"])
+        trend_df["district_name"] = trend_df["DISTRICT"].map(DISTRICT_MAP).fillna(trend_df["DISTRICT"])
+
+        # Filter to valid districts only
+        valid_districts = [d for d in trend_df["DISTRICT"].unique() if d in DISTRICT_MAP]
+
+        # Toggle: monthly or yearly
+        view_mode = st.radio("View by:", ["Monthly", "Yearly"], horizontal=True, key="trend_view")
+
+        # District selector
+        selected_trend_districts = st.multiselect(
+            "Select districts to compare:",
+            options=[f"{DISTRICT_MAP.get(d, d)} ({d})" for d in sorted(valid_districts)],
+            default=[f"{DISTRICT_MAP.get(d, d)} ({d})" for d in sorted(valid_districts)[:3]],
+            key="trend_districts"
+        )
+
+        # Extract codes from selection
+        selected_codes = [s.split("(")[-1].replace(")", "").strip() for s in selected_trend_districts]
+
+        if selected_codes:
+            filtered_trend = trend_df[trend_df["DISTRICT"].isin(selected_codes)].copy()
+
+            if view_mode == "Yearly":
+                filtered_trend["period"] = filtered_trend["MONTH"].dt.year.astype(str)
+                grouped = filtered_trend.groupby(["period", "district_name"])["CRIME_COUNT"].sum().reset_index()
+            else:
+                filtered_trend["period"] = filtered_trend["MONTH"].dt.to_period("M").astype(str)
+                grouped = filtered_trend.groupby(["period", "district_name"])["CRIME_COUNT"].sum().reset_index()
+
+            pivot = grouped.pivot(index="period", columns="district_name", values="CRIME_COUNT").fillna(0)
+            st.line_chart(pivot)
+        else:
+            st.info("Select at least one district to display the trend.")
+    else:
+        st.info("Trend data unavailable.")
