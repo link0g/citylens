@@ -247,6 +247,11 @@ def router_node(state: CityLensState) -> CityLensState:
     elif ('transit' in query or 'mbta' in query or 'commute' in query) and \
          ('housing' in query or 'neighborhood' in query or 'live' in query):
         branch = 'cross'
+    elif ('neighborhood' in query or 'area' in query) and \
+         ('crime' in query or 'crime rate' in query or 'dangerous' in query or 'safe' in query):
+        branch = 'cross'
+    elif any(w in query for w in ['commercial', 'investment', 'office', 'retail', 'business']):
+        branch = 'cross'  # 新增
     elif cross_score >= 1 and sum(1 for s in scores.values() if s > 0) >= 2:
         branch = 'cross'
     elif cross_score >= 2:
