@@ -988,6 +988,7 @@ def run_citylens(user_query: str) -> str:
     # Check cache
     cache_key = user_query.lower().strip()
     if cache_key in _query_cache:
+        cached = _query_cache[cache_key]
         print("  ⚡ Cache hit! Returning cached answer.")
         cached = _query_cache[cache_key]
         print(f"\n{'='*60}")
@@ -995,7 +996,17 @@ def run_citylens(user_query: str) -> str:
         print(cached["answer"])
         print(f"\n⏱  Latency    : 0ms (cached)")
         print(f"🎯 Confidence : {cached['confidence']}")
-        return cached["answer"]
+        return {
+            "answer":        cached["answer"],
+            "branch":        cached.get("branch", ""),
+            "intent":        cached.get("intent", ""),
+            "confidence":    cached["confidence"],
+            "latency_ms":    0,
+            "retrievals":    cached.get("retrievals", 0),
+            "sub_questions": cached.get("sub_questions", []),
+            "use_multistep": cached.get("use_multistep", False),
+            "cached":        True
+    }
 
     initial_state: CityLensState = {
         "user_query":       user_query,
@@ -1025,7 +1036,12 @@ def run_citylens(user_query: str) -> str:
     
     _query_cache[cache_key] = {
         "answer":     result["final_answer"],
-        "confidence": result["confidence_score"]
+        "confidence": result["confidence_score"],
+        "branch":        result["branch"],
+    "intent":        result["intent"],
+    "retrievals":    result["total_retrievals"],
+    "sub_questions": result.get("sub_questions", []),
+    "use_multistep": result.get("use_multistep", False),
     }
 
     print(f"\n{'='*60}")
@@ -1037,7 +1053,17 @@ def run_citylens(user_query: str) -> str:
     print(f"🎯 Confidence : {result['confidence_score']}")
     print(f"🌿 Branch     : {result['branch']}")
 
-    return result["final_answer"]
+    return {
+        "answer":        result["final_answer"],
+        "branch":        result["branch"],
+        "intent":        result["intent"],
+        "confidence":    result["confidence_score"],
+        "latency_ms":    result["latency_ms"],
+        "retrievals":    result["total_retrievals"],
+        "sub_questions": result.get("sub_questions", []),
+        "use_multistep": result.get("use_multistep", False),
+        "cached":        False
+}
 
 
 
@@ -1047,5 +1073,7 @@ def run_citylens(user_query: str) -> str:
 
 if __name__ == "__main__":
     run_citylens("What are the most expensive neighborhoods in Boston?")
-    run_citylens("What are the best commercial investment areas in Boston?")
+    run_citylens("What about crime rates in those neighborhoods?")
+    run_citylens("And how is the transit access there?")
+ 
     
