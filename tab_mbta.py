@@ -285,17 +285,19 @@ def render_mbta_tab(session, DB):
                 by_cause = alerts_df.groupby("CAUSE")["TOTAL_ALERTS"].sum().reset_index()
                 st.bar_chart(by_cause.set_index("CAUSE")["TOTAL_ALERTS"])
             st.divider()
+            st.markdown("#### 📋 Service Disruption Summary")
+            st.caption("Top alerts by route, ranked by total alert count. Shows cause and service impact.")
             st.dataframe(alerts_df, use_container_width=True)
         else:
             st.info("Alerts data unavailable.")
 
-        st.divider()
-        st.markdown("#### 🚨 Top Anomalies Detected")
-        anomaly_df = load_anomalies()
-        if not anomaly_df.empty:
-            st.dataframe(anomaly_df, use_container_width=True)
-        else:
-            st.info("Anomaly data unavailable.")
+        # st.divider()
+        # st.markdown("#### 🚨 Top Anomalies Detected")
+        # anomaly_df = load_anomalies()
+        # if not anomaly_df.empty:
+        #     st.dataframe(anomaly_df, use_container_width=True)
+        # else:
+        #     st.info("Anomaly data unavailable.")
 
     # ── Station Map ───────────────────────────────────────────────────────────
     with mtab4:
